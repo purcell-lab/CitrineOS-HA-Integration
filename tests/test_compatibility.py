@@ -18,6 +18,7 @@ from custom_components.citrine_ha.compatibility import (
 from custom_components.citrine_ha.coordinator import CitrineCoordinator
 from custom_components.citrine_ha.hasura_client import HasuraClient, HasuraAuthError, HasuraError
 from custom_components.citrine_ha.load_controller import CitrineLoadController
+from custom_components.citrine_ha.config_flow import CitrineConfigFlow
 
 
 def client(session=None, **kwargs):
@@ -164,6 +165,35 @@ async def test_hasura_auth_html_is_classified_before_json_and_errors_are_safe():
     session.post.return_value = Response(status=302)
     with pytest.raises(HasuraError, match="redirect"):
         await c.ping()
+
+
+@pytest.mark.asyncio
+async def test_hasura_mutation_rejected_before_network():
+    session = MagicMock()
+    c = HasuraClient(session, url="http://hasura.invalid", token=None,
+                     request_timeout=2, verify_ssl=True)
+    with pytest.raises(HasuraError, match="read-only"):
+        await c.query("mutation { delete_ChargingStations(where: {}) { affected_rows } }")
+    session.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_v2_config_validation_requires_hasura_and_uses_discovery_query():
+    flow = CitrineConfigFlow()
+    flow.hass = MagicMock()
+    values = {"api_profile": PROFILE_V2, "base_url": "http://citrine.invalid",
+              "tenant_id": 1, "request_timeout": 2}
+    with patch("custom_components.citrine_ha.config_flow.async_get_clientsession"):
+        with pytest.raises(CitrineCompatibilityError, match="Hasura"):
+            await flow._async_validate(values)
+        with patch("custom_components.citrine_ha.config_flow.CitrineClient") as api, \
+             patch("custom_components.citrine_ha.config_flow.HasuraClient") as gql:
+            api.return_value.ping = AsyncMock()
+            gql.return_value.query = AsyncMock(return_value=discovery())
+            await flow._async_validate({**values, "hasura_url": "http://hasura.invalid"})
+            api.return_value.ping.assert_awaited_once()
+            gql.return_value.query.assert_awaited_once()
+            gql.return_value.ping.assert_not_called()
 
 
 def controller_env(read_only=True):

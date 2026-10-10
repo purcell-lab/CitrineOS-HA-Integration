@@ -81,6 +81,7 @@ class HasuraClient:
                     errors = data["errors"]
                     if isinstance(errors, list) and any(
                         isinstance(item, dict) and
+                        isinstance(item.get("extensions"), dict) and
                         item.get("extensions", {}).get("code") in
                         ("access-denied", "invalid-jwt", "invalid-headers")
                         for item in errors

@@ -901,6 +901,8 @@ class CitrineClient:
             raise CitrineApiError(f"Citrine API timeout calling {path}") from err
         except aiohttp.ClientError as err:
             raise CitrineApiError("Citrine API transport error") from err
+        except ValueError as err:
+            raise CitrineApiError("Invalid Citrine API JSON response") from err
 
     async def _request_with_fallback_paths(
         self,
