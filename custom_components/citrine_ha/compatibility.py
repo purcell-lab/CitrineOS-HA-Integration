@@ -23,7 +23,8 @@ query ChargingStations($tenantId: Int!) {
     chargePointVendor chargePointModel firmwareVersion updatedAt
   }
   Connectors(where: {tenantId: {_eq: $tenantId}}, limit: 501) {
-    id stationId tenantId connectorId evseId status errorCode updatedAt
+    id stationId tenantId connectorId evseId evseTypeConnectorId status errorCode updatedAt
+    Evse { id stationId tenantId evseTypeId }
   }
   Transactions(where: {tenantId: {_eq: $tenantId}, isActive: {_eq: true}}, limit: 501) {
     id stationId tenantId transactionId isActive
@@ -43,28 +44,45 @@ def normalize_v2_discovery(result, tenant_id):
         rows = data.get(key)
         if not isinstance(rows, list) or len(rows) > 500:
             raise ValueError("Missing discovery collection or 500-row limit exceeded")
-        if any(not isinstance(row, dict) or row.get("tenantId") != tenant_id for row in rows):
+        if any(not isinstance(row, dict) or type(row.get("tenantId")) is not int
+               or row.get("tenantId") != tenant_id for row in rows):
             raise ValueError("Invalid discovery row or tenant mismatch")
         collections.append(rows)
     stations, connectors, transactions = collections
     names = {}
     seen_names = set()
     normalized = []
+    protocols = {}
     for row in stations:
         key, name = row.get("id"), row.get("ocppConnectionName")
         if (type(key) is not int or not isinstance(name, str) or not name.strip()
                 or key in names or name in seen_names):
             raise ValueError("Missing or ambiguous station identity")
         names[key] = name
+        protocols[key] = row.get("protocol")
         seen_names.add(name)
         normalized.append({**row, "databaseId": key, "id": name})
     children = []
-    for rows in (connectors, transactions):
+    for is_connector, rows in ((True, connectors), (False, transactions)):
         values = []
         for row in rows:
             key = row.get("stationId")
             if type(key) is not int or key not in names:
                 raise ValueError("Unresolved station relationship")
-            values.append({**row, "databaseStationId": key, "stationId": names[key]})
+            item = {**row, "databaseStationId": key, "stationId": names[key]}
+            if is_connector:
+                evse = row.get("Evse")
+                if (not isinstance(evse, dict) or evse.get("tenantId") != tenant_id
+                        or evse.get("stationId") != key or evse.get("id") != row.get("evseId")):
+                    raise ValueError("Unresolved EVSE relationship")
+                legacy = protocols[key] in ("1.6", "ocpp1.6")
+                connector_id = row.get("connectorId") if legacy else row.get("evseTypeConnectorId")
+                evse_id = connector_id if legacy else evse.get("evseTypeId")
+                if (type(connector_id) is not int or connector_id < 1
+                        or type(evse_id) is not int or evse_id < 1):
+                    raise ValueError("Missing OCPP connector or EVSE identity")
+                item.update(databaseEvseId=row["evseId"], evseId=evse_id,
+                            connectorId=connector_id, legacyConnectorId=row.get("connectorId"))
+            values.append(item)
         children.append(values)
     return {"stations": normalized, "connectors": children[0], "transactions": children[1]}

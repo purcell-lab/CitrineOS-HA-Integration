@@ -109,6 +109,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         citrine_client=client,
         entry_data=dict(entry.data),
         entry_options=dict(entry.options),
+        config_entry=entry,
     )
 
     try:

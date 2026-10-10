@@ -107,11 +107,8 @@ class CitrineClient:
             "/data/configuration/chargingStations",
             "/data/chargingStations",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            raise
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def get_connectors(self) -> list[dict[str, Any]]:
         """Fetch connectors/EVSEs directly from CitrineOS REST data endpoints."""
@@ -124,11 +121,8 @@ class CitrineClient:
             "/data/configuration/connectors",
             "/data/connectors",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            raise
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def get_transactions(self, *, limit: int = 500) -> list[dict[str, Any]]:
         """Fetch active/recent transactions directly from CitrineOS REST data endpoints."""
@@ -139,11 +133,8 @@ class CitrineClient:
             "/data/transactions/activeTransactions",
             "/data/transaction",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            raise
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def discover_chargers_rest(self) -> dict[str, Any]:
         """Perform full discovery via CitrineOS REST endpoints (no Hasura required)."""
@@ -157,6 +148,21 @@ class CitrineClient:
             "connectors": connectors,
             "transactions": transactions,
         }
+
+    @staticmethod
+    def _validated_collection(response: Any) -> list[dict[str, Any]]:
+        candidate = response
+        if isinstance(response, dict):
+            for key in ("data", "items", "rows", "chargingStations", "connectors", "transactions"):
+                if key in response:
+                    candidate = response[key]
+                    break
+            else:
+                if any(key in response for key in ("id", "stationId", "identifier")):
+                    candidate = [response]
+        if not isinstance(candidate, list) or any(not isinstance(row, dict) for row in candidate):
+            raise CitrineCompatibilityError("Invalid discovery collection")
+        return candidate
 
     @staticmethod
     def _extract_items_from_response(response: Any) -> list[dict[str, Any]]:

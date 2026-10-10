@@ -31,7 +31,8 @@ def discovery():
         "ChargingStations": [{"id": 42, "ocppConnectionName": "SIM-CITRINE-LAB-01",
                              "tenantId": 1, "protocol": "ocpp2.0.1", "isOnline": True}],
         "Connectors": [{"id": 8, "stationId": 42, "tenantId": 1, "connectorId": 1,
-                        "evseId": 1, "status": "Available"}],
+                        "evseId": 7, "evseTypeConnectorId": 2, "status": "Available",
+                        "Evse": {"id": 7, "stationId": 42, "tenantId": 1, "evseTypeId": 3}}],
         "Transactions": [{"id": 91, "stationId": 42, "tenantId": 1,
                           "transactionId": "tx-1", "isActive": True}],
     }}
@@ -51,9 +52,12 @@ def test_v2_station_database_identity_is_not_command_identity():
     assert rows["stations"][0]["databaseId"] == 42
     assert rows["connectors"][0]["stationId"] == "SIM-CITRINE-LAB-01"
     assert rows["transactions"][0]["databaseStationId"] == 42
+    assert rows["connectors"][0]["databaseEvseId"] == 7
+    assert rows["connectors"][0]["evseId"] == 3
+    assert rows["connectors"][0]["connectorId"] == 2
 
 
-@pytest.mark.parametrize("failure", ["tenant", "missing", "duplicate", "orphan", "bound"])
+@pytest.mark.parametrize("failure", ["tenant", "missing", "duplicate", "orphan", "evse", "bound"])
 def test_v2_rejects_unsafe_discovery(failure):
     data = discovery()
     if failure == "tenant":
@@ -64,6 +68,8 @@ def test_v2_rejects_unsafe_discovery(failure):
         data["data"]["ChargingStations"] *= 2
     elif failure == "orphan":
         data["data"]["Transactions"][0]["stationId"] = 77
+    elif failure == "evse":
+        data["data"]["Connectors"][0]["Evse"]["stationId"] = 77
     else:
         data["data"]["Connectors"] *= 501
     with pytest.raises(ValueError):
@@ -106,6 +112,16 @@ async def test_legacy_discovery_errors_are_not_empty_success(error):
     for method in (c.get_charging_stations, c.get_connectors, c.get_transactions):
         with pytest.raises(CitrineApiError):
             await method()
+
+
+@pytest.mark.asyncio
+async def test_bad_discovery_payload_does_not_become_empty_success():
+    c = client()
+    c._request = AsyncMock(return_value="<html>Sign in</html>")
+    with pytest.raises(CitrineCompatibilityError):
+        await c.get_charging_stations()
+    c._request.return_value = []
+    assert await c.get_charging_stations() == []
 
 
 class Response:

@@ -12,6 +12,9 @@ from custom_components.citrine_ha.const import (
     CONF_DOE_EXPORT_LIMIT_SENSOR,
     CONF_DOE_IMPORT_LIMIT_SENSOR,
     CONF_GRID_POWER_SENSOR,
+    CONF_GRID_PHASE_A_CURRENT_SENSOR,
+    CONF_GRID_PHASE_B_CURRENT_SENSOR,
+    CONF_GRID_PHASE_C_CURRENT_SENSOR,
     CONF_MAIN_FUSE_LIMIT_W,
     CONF_MIN_CHARGE_CURRENT_A,
     CONF_MIN_DWELL_SECS,
@@ -35,6 +38,7 @@ from custom_components.citrine_ha.load_controller import CitrineLoadController
 def mock_controller_env():
     """Build mock HA environment with coordinator and client."""
     hass = MagicMock()
+    hass.async_create_task.side_effect = lambda coro: coro.close()
     entry = MagicMock()
     coordinator = MagicMock()
     client = MagicMock()
@@ -336,4 +340,3 @@ async def test_export_is_surplus_and_does_not_inflate_site_headroom(mock_control
 
     assert controller.solar_surplus_w == 6000.0
     assert controller.site_headroom_w == 14400.0
-

@@ -7,6 +7,10 @@ establish live OCPP command compatibility. It complements the
 
 ## Profiles
 
+This staged branch declares Home Assistant **2026.10.0** as its minimum and
+tests against that published runtime. Older HA releases are not claimed
+compatible; coordinator setup passes its config entry explicitly.
+
 | Profile | Connection validation | Discovery | Control |
 | --- | --- | --- | --- |
 | `legacy` | Existing `/data/ocpprouter/systemConfig` | Configured Hasura, otherwise legacy REST | Read-only by default; explicit option needed to enable existing control |
@@ -54,6 +58,11 @@ normalises display/relationship references to the latter. Duplicate identities,
 cross-tenant data, missing collections and orphan relationships fail discovery.
 No command routing is enabled by this mapping.
 
+EVSE and connector database keys are also distinct from OCPP numbers. The fixed
+query joins the `Evse` relationship and maps `evseTypeId` and
+`evseTypeConnectorId` for 2.x stations, retaining database keys separately.
+Missing or ambiguous mappings fail rather than substituting database IDs.
+
 The fixed query reads stations, connectors and active transactions, bounded at
 500 rows per collection. A 501st row produces an explicit failure; pagination
 and historical transaction loading are deferred. Transaction `startTime` and
@@ -78,6 +87,13 @@ guards, unavailable-discovery guards and existing controller behaviour.
 All responses and stations in these tests are fixtures. No live HA, Hasura,
 broker, server or charger is contacted. CI installs a pinned Home Assistant
 test runtime; it does not install this integration on an operator's system.
+
+The suite also checks query fields against the pinned server model files.
+This is a static schema check, not a live GraphQL query. The existing allocator
+suite has three known failing assertions; CI runs it against both the unmodified
+client baseline and this branch and requires the exact same failure set.
+These failures remain documented debt, not passing tests. No allocation
+algorithm is changed by this PR.
 
 Before activation:
 

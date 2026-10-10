@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .citrine_api import CitrineApiError, CitrineClient
@@ -55,6 +56,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         citrine_client: CitrineClient,
         entry_data: dict[str, Any],
         entry_options: dict[str, Any],
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         scan_interval = entry_options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         super().__init__(
@@ -62,6 +64,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             name="citrine_ha",
             update_interval=timedelta(seconds=scan_interval),
+            config_entry=config_entry,
         )
         self._hasura_client = hasura_client
         self._citrine_client = citrine_client

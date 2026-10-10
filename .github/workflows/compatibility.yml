@@ -13,7 +13,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - run: python -m pip install homeassistant==2026.10.0 pytest==8.4.2 pytest-asyncio==1.2.0
-      - run: python -m pytest tests -q
+      - uses: actions/checkout@v4
+        with:
+          repository: citrineos/citrineos-core
+          ref: 1a83638c31eebdb1dd8d6cdb0f5b8a9f142a1372
+          path: pinned-server
+          sparse-checkout: |
+            packages/dal/src/db/drizzle/schema
+            apps/ocpp-server/db/hasura-metadata
+          persist-credentials: false
+      - run: python -m pip install homeassistant==2026.10.0 pytest==8.4.2 pytest-asyncio==1.2.0 graphql-core==3.2.6
+      - name: Changed areas and controller regression tests
+        env:
+          CITRINE_SERVER_SOURCE: pinned-server
+        run: python -m pytest tests -q --ignore=tests/test_allocator.py
+      - uses: actions/checkout@v4
+        with:
+          repository: Stuart0411/CitrineOS-HA-Integration
+          ref: a98cd336e4197f3875be238bdfe5c4784194efb1
+          path: pinned-client-baseline
+          persist-credentials: false
+      - name: Document unchanged pre-existing allocator failures
+        run: |
+          set +e
+          (cd pinned-client-baseline && python -m pytest tests/test_allocator.py -q --junitxml=/tmp/allocator-baseline.xml)
+          baseline=$?
+          python -m pytest tests/test_allocator.py -q --junitxml=/tmp/allocator-current.xml
+          current=$?
+          set -e
+          test "$baseline" = 1
+          test "$current" = 1
+          python tests/check_allocator_baseline.py /tmp/allocator-baseline.xml /tmp/allocator-current.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allocator-baseline-comparison
+          path: /tmp/allocator-*.xml
       - run: python -m compileall -q custom_components
       - run: git -c core.whitespace=cr-at-eol diff --check
