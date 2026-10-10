@@ -1,6 +1,7 @@
 """Local Load Controller for CitrineOS and Home Assistant."""
 
 from __future__ import annotations
+from .compatibility import is_read_only
 
 import asyncio
 from datetime import UTC, datetime
@@ -140,6 +141,9 @@ class CitrineLoadController:
 
     async def async_start(self) -> None:
         """Start the controller loop and sensor listeners."""
+        if is_read_only(self.entry.data, self.entry.options):
+            self.state_status = "Read only"
+            return
         interval = int(
             self.entry.options.get(CONF_CONTROLLER_INTERVAL_SECS)
             or self.entry.data.get(CONF_CONTROLLER_INTERVAL_SECS, DEFAULT_CONTROLLER_INTERVAL_SECS)
@@ -222,6 +226,12 @@ class CitrineLoadController:
                 _LOGGER.error("Error in Citrine load control cycle: %s", err, exc_info=True)
 
     async def _execute_control_cycle(self) -> None:
+        if is_read_only(self.entry.data, self.entry.options):
+            self.state_status = "Read only"
+            return
+        if not self.coordinator.last_update_success:
+            self.state_status = "Discovery unavailable"
+            return
         now = datetime.now(UTC)
         self.last_run_timestamp = now.isoformat()
 
@@ -531,6 +541,8 @@ class CitrineLoadController:
 
     async def _apply_station_limit(self, st_ctx: StationLoadContext, limit_w: float) -> None:
         """Send charging limit to CitrineOS for a station."""
+        if is_read_only(self.entry.data, self.entry.options) or not self.coordinator.last_update_success:
+            return
         protocol = self.coordinator.get_station_protocol(st_ctx.station_id, st_ctx.protocol) or "ocpp2.0.1"
         self.last_command_status = "pending"
         self.last_command_station_id = st_ctx.station_id
@@ -552,7 +564,7 @@ class CitrineLoadController:
                 evse_id=st_ctx.evse_id,
                 duration=300,
             )
-            self.last_command_status = "accepted"
+            self.last_command_status = "dispatched"
             self.last_command_timestamp = datetime.now(UTC).isoformat()
         except CitrineApiError as err:
             _LOGGER.warning(

@@ -65,6 +65,7 @@ from .const import (
 )
 from .coordinator import CitrineCoordinator
 from .hasura_client import HasuraClient
+from .compatibility import CONF_API_PROFILE, PROFILE_LEGACY, is_read_only
 from .load_controller import CitrineLoadController
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         auth_token=entry.data.get(CONF_AUTH_TOKEN),
         verify_ssl=verify_ssl,
         request_timeout=int(entry.data[CONF_REQUEST_TIMEOUT]),
+        api_profile=entry.data.get(CONF_API_PROFILE, PROFILE_LEGACY),
+        read_only=is_read_only(entry.data, entry.options),
     )
 
     hasura_client: HasuraClient | None = None
@@ -127,7 +130,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "controller": controller,
     }
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    platforms = ["sensor"] if client.read_only else PLATFORMS
+    hass.data[DOMAIN][entry.entry_id]["platforms"] = platforms
+    await hass.config_entries.async_forward_entry_setups(entry, platforms)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
     await controller.async_start()
@@ -141,7 +146,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry_data and "controller" in entry_data:
         await entry_data["controller"].async_stop()
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    platforms = entry_data.get("platforms", PLATFORMS) if entry_data else PLATFORMS
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
@@ -391,12 +397,12 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         )
 
     async def async_handle_sync(call: ServiceCall) -> None:
-        ctx = _resolve_context(hass, call)
+        ctx = _resolve_context(hass, call, control=False)
         coordinator = ctx["coordinator"]
         await coordinator.async_request_refresh()
 
     async def async_handle_sync_ems_telemetry(call: ServiceCall) -> None:
-        ctx = _resolve_context(hass, call)
+        ctx = _resolve_context(hass, call, control=False)
         coordinator: CitrineCoordinator = ctx["coordinator"]
         site_id = call.data.get(ATTR_SITE_ID)
         limit = call.data.get(ATTR_TELEMETRY_LIMIT)
@@ -406,7 +412,7 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         )
 
     async def async_handle_clear_ems_telemetry_error(call: ServiceCall) -> None:
-        ctx = _resolve_context(hass, call)
+        ctx = _resolve_context(hass, call, control=False)
         coordinator: CitrineCoordinator = ctx["coordinator"]
         coordinator.clear_intake_telemetry_error()
 
@@ -573,7 +579,7 @@ async def _async_register_services(hass: HomeAssistant) -> None:
     )
 
 
-def _resolve_context(hass: HomeAssistant, call: ServiceCall) -> dict[str, Any]:
+def _resolve_context(hass: HomeAssistant, call: ServiceCall, *, control: bool = True) -> dict[str, Any]:
     entry_id = call.data.get(ATTR_ENTRY_ID)
     if entry_id:
         data = hass.data[DOMAIN].get(entry_id)
@@ -582,15 +588,25 @@ def _resolve_context(hass: HomeAssistant, call: ServiceCall) -> dict[str, Any]:
         entry = hass.config_entries.async_get_entry(entry_id)
         if entry is None:
             raise HomeAssistantError(f"Entry metadata not found: {entry_id}")
+        if control and is_read_only(entry.data, entry.options):
+            raise HomeAssistantError("Read-only entry: station and controller commands are disabled")
+        if control and not data["coordinator"].last_update_success:
+            raise HomeAssistantError("Discovery is unavailable; control is blocked")
         return {**data, "entry": entry}
 
     if not hass.data[DOMAIN]:
         raise HomeAssistantError("No CitrineOS config entries loaded")
+    if len(hass.data[DOMAIN]) != 1:
+        raise HomeAssistantError("Specify entry_id when multiple CitrineOS entries are loaded")
 
     first_entry_id, data = next(iter(hass.data[DOMAIN].items()))
     entry = hass.config_entries.async_get_entry(first_entry_id)
     if entry is None:
         raise HomeAssistantError("Default entry metadata not found")
+    if control and is_read_only(entry.data, entry.options):
+        raise HomeAssistantError("Read-only entry: station and controller commands are disabled")
+    if control and not data["coordinator"].last_update_success:
+        raise HomeAssistantError("Discovery is unavailable; control is blocked")
     return {**data, "entry": entry}
 
 
