@@ -45,8 +45,10 @@ role needs permission for the selected tariff-read probe; this PR does not
 broaden its permissions or fetch a privileged token.
 
 Hasura is checked separately using the actual discovery query, not `__typename`
-alone. Configure its existing URL and secret explicitly; no endpoint or secret
-is generated. Server-side tenant isolation and a read-only Hasura role remain
+alone. For the 2.x profile, configure the read-only gateway's `/v1/graphql` URL
+and bearer token, not a Hasura administrator secret. The legacy profile retains
+its existing admin-secret-header convention. No endpoint or secret is generated.
+Server-side tenant isolation and a read-only Hasura role remain
 deployment requirements. Query filters are defence in depth, not a substitute
 for server-side authorisation.
 

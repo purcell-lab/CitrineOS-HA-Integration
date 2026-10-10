@@ -65,7 +65,7 @@ from .const import (
 )
 from .coordinator import CitrineCoordinator
 from .hasura_client import HasuraClient
-from .compatibility import CONF_API_PROFILE, PROFILE_LEGACY, is_read_only
+from .compatibility import CONF_API_PROFILE, PROFILE_LEGACY, PROFILE_V2, is_read_only
 from .load_controller import CitrineLoadController
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,6 +99,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             session,
             url=entry.data[CONF_HASURA_URL],
             token=entry.data.get(CONF_HASURA_TOKEN),
+            bearer_auth=entry.data.get(CONF_API_PROFILE) == PROFILE_V2,
             request_timeout=int(entry.data[CONF_REQUEST_TIMEOUT]),
             verify_ssl=verify_ssl,
         )

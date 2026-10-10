@@ -184,6 +184,19 @@ async def test_hasura_auth_html_is_classified_before_json_and_errors_are_safe():
 
 
 @pytest.mark.asyncio
+async def test_v2_hasura_uses_gateway_bearer_without_admin_header():
+    session = MagicMock()
+    session.post.return_value = Response(data={"data": {"__typename": "query_root"}})
+    c = HasuraClient(session, url="http://gateway.invalid/v1/graphql", token="fixture",
+                     request_timeout=2, verify_ssl=True, bearer_auth=True)
+    await c.ping()
+    headers = session.post.call_args.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer fixture"
+    assert "x-hasura-admin-secret" not in headers
+    assert session.post.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
 async def test_hasura_mutation_rejected_before_network():
     session = MagicMock()
     c = HasuraClient(session, url="http://hasura.invalid", token=None,

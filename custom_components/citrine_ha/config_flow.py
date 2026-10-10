@@ -354,6 +354,7 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 session,
                 url=hasura_url,
                 token=data.get(CONF_HASURA_TOKEN) or None,
+                bearer_auth=data.get(CONF_API_PROFILE) == PROFILE_V2,
                 request_timeout=int(data[CONF_REQUEST_TIMEOUT]),
                 verify_ssl=verify_ssl,
             )

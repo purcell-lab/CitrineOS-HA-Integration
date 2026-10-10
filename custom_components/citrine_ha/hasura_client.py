@@ -32,12 +32,14 @@ class HasuraClient:
         token: str | None,
         request_timeout: int,
         verify_ssl: bool,
+        bearer_auth: bool = False,
     ) -> None:
         self._session = session
         self._url = url.rstrip("/")
         self._token = token
         self._request_timeout = request_timeout
         self._verify_ssl = verify_ssl
+        self._bearer_auth = bearer_auth
 
     async def ping(self) -> None:
         """Validate Hasura endpoint and auth."""
@@ -54,7 +56,10 @@ class HasuraClient:
             "Content-Type": "application/json",
         }
         if self._token:
-            headers["x-hasura-admin-secret"] = self._token
+            if self._bearer_auth:
+                headers["Authorization"] = "Bearer " + self._token
+            else:
+                headers["x-hasura-admin-secret"] = self._token
 
         payload = {"query": query, "variables": variables or {}}
 
