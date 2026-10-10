@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .citrine_api import CitrineApiError, CitrineClient
@@ -36,7 +37,10 @@ from .const import (
     DEFAULT_EMS_TELEMETRY_LIMIT,
     DEFAULT_EMS_TELEMETRY_STALE_SECS,
 )
-from .hasura_client import HasuraClient, HasuraError
+from .hasura_client import HasuraAuthError, HasuraClient, HasuraError
+from .compatibility import (
+    CONF_API_PROFILE, PROFILE_V2, V2_DISCOVERY_QUERY, normalize_v2_discovery,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         citrine_client: CitrineClient,
         entry_data: dict[str, Any],
         entry_options: dict[str, Any],
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         scan_interval = entry_options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         super().__init__(
@@ -59,6 +64,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             name="citrine_ha",
             update_interval=timedelta(seconds=scan_interval),
+            config_entry=config_entry,
         )
         self._hasura_client = hasura_client
         self._citrine_client = citrine_client
@@ -70,55 +76,41 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         tenant_id = int(self._entry_data[CONF_TENANT_ID])
-        intake_telemetry = await self._fetch_intake_telemetry_with_fallback(tenant_id)
+        try:
+            return await self._fetch_discovery(tenant_id)
+        except (CitrineApiError, HasuraError, ValueError) as err:
+            # HA retains last data but marks entities unavailable. Never report
+            # cached or empty discovery as a successful refresh after failure.
+            raise UpdateFailed(str(err)) from err
 
-        # 1. Try Hasura discovery if configured
+    async def _fetch_discovery(self, tenant_id: int) -> dict[str, Any]:
+        if self._entry_data.get(CONF_API_PROFILE) == PROFILE_V2:
+            if not self._hasura_client:
+                raise ValueError("CitrineOS 2.x requires Hasura discovery")
+            await self._citrine_client.ping()
+            result = await self._hasura_client.query(
+                V2_DISCOVERY_QUERY, variables={"tenantId": tenant_id})
+            rows = normalize_v2_discovery(result, tenant_id)
+            merged = self._merge_station_state(**rows)
+            self._refresh_station_caches(merged)
+            return {**rows, "stations": merged, "source": "hasura_v2",
+                    "read_only": True,
+                    "api_access": "protected_read_verified",
+                    "station_control": "not_verified",
+                    "intake_telemetry": self._telemetry_defaults(tenant_id, None)}
+
+        intake_telemetry = await self._fetch_intake_telemetry_with_fallback(tenant_id)
+        # A configured discovery backend is authoritative, including empty data.
         if self._hasura_client:
             hasura_payload = await self._try_hasura_discovery(tenant_id, intake_telemetry)
-            if hasura_payload and hasura_payload.get("stations"):
+            if hasura_payload is not None:
                 return hasura_payload
-            _LOGGER.debug("Hasura discovery returned no stations or failed; falling back to direct CitrineOS REST discovery")
-
-        # 2. Direct CitrineOS REST Discovery (Zero-Hasura primary / fallback)
-        try:
-            rest_data = await self._citrine_client.discover_chargers_rest()
-            rest_stations = rest_data.get("stations", [])
-            rest_connectors = rest_data.get("connectors", [])
-            rest_transactions = rest_data.get("transactions", [])
-
-            if rest_stations:
-                merged_stations = self._merge_station_state(
-                    stations=rest_stations,
-                    connectors=rest_connectors,
-                    transactions=rest_transactions,
-                )
-                self._refresh_station_caches(merged_stations)
-                return {
-                    "stations": merged_stations,
-                    "connectors": rest_connectors,
-                    "transactions": rest_transactions,
-                    "intake_telemetry": intake_telemetry,
-                    "source": "citrine_rest",
-                }
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("CitrineOS REST discovery failed: %s", err)
-
-        # 3. Retain cached stations or return fallback discovery state
-        if self.data and isinstance(self.data.get("stations"), list):
-            previous_stations = [
-                item for item in self.data.get("stations", []) if isinstance(item, dict)
-            ]
-            if previous_stations:
-                _LOGGER.warning(
-                    "Discovery returned zero stations; retaining %s previously discovered stations",
-                    len(previous_stations),
-                )
-                return {
-                    **self.data,
-                    "intake_telemetry": intake_telemetry,
-                }
-
-        return self._fallback_discovery_payload(intake_telemetry, "No charging stations discovered via Hasura or Citrine REST")
+            raise HasuraError("Hasura discovery did not return a usable collection")
+        rows = await self._citrine_client.discover_chargers_rest()
+        merged = self._merge_station_state(**rows)
+        self._refresh_station_caches(merged)
+        return {**rows, "stations": merged, "intake_telemetry": intake_telemetry,
+                "source": "citrine_rest"}
 
     async def _try_hasura_discovery(
         self,
@@ -144,6 +136,8 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     variables={"tenantId": tenant_id},
                 )
                 break
+            except HasuraAuthError:
+                raise
             except HasuraError as err:
                 last_hasura_error = err
                 if "not a valid graphql query" in str(err).lower() and active_query != DEFAULT_HASURA_QUERY:
@@ -190,7 +184,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             connectors=connectors,
             transactions=transactions,
         )
-        if merged_stations:
+        if isinstance(data.get("ChargingStations"), list) or merged_stations:
             self._refresh_station_caches(merged_stations)
             return {
                 "stations": merged_stations,
@@ -245,6 +239,8 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 minimal_query,
                 variables={"tenantId": tenant_id},
             )
+        except HasuraAuthError:
+            raise
         except HasuraError as err:
             _LOGGER.debug("Minimal Hasura discovery query also failed: %s", err)
             return None
@@ -255,6 +251,8 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Refresh only EMS intake telemetry and push coordinator update."""
+        if not self.last_update_success:
+            raise UpdateFailed("Refresh discovery before updating telemetry")
         tenant_id = int(self._entry_data[CONF_TENANT_ID])
         intake_telemetry = await self._fetch_intake_telemetry_with_fallback(
             tenant_id,
@@ -269,6 +267,8 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def clear_intake_telemetry_error(self) -> None:
         """Clear cached telemetry error without forcing a refetch."""
+        if not self.last_update_success:
+            raise UpdateFailed("Refresh discovery before clearing telemetry errors")
         current = dict(self.data or {})
         telemetry = dict(current.get("intake_telemetry") or {})
         if not telemetry:
@@ -333,6 +333,10 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         limit: int | None = None,
     ) -> dict[str, Any]:
         fetched_at = datetime.now(UTC).isoformat()
+        if self._entry_data.get(CONF_API_PROFILE) == PROFILE_V2:
+            result = self._telemetry_defaults(tenant_id, site_id)
+            result["error"] = "EMS intake telemetry is not supported by the 2.x read-only profile"
+            return result
         endpoint_prefix = str(
             self._entry_options.get(CONF_EMS_ENDPOINT_PREFIX, DEFAULT_EMS_ENDPOINT_PREFIX)
             or DEFAULT_EMS_ENDPOINT_PREFIX
@@ -657,6 +661,8 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return str(tx_id)
 
     def _refresh_station_caches(self, stations: list[dict[str, Any]]) -> None:
+        self._protocol_cache.clear()
+        self._capability_cache.clear()
         for station in stations:
             station_id = str(station.get("id", ""))
             if not station_id:

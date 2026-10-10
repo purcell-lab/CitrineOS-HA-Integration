@@ -1,5 +1,9 @@
 # CitrineOS Home Assistant Energy Controller
 
+> Staged compatibility work: see [CitrineOS 2.x read-only setup and upgrade
+> precautions](docs/v2-readonly-compatibility.md). New and upgraded entries default
+> to read-only; 2.x control remains disabled. This branch is not a deployment.
+
 <p align="center">
   <img src="https://avatars.githubusercontent.com/u/132117031?s=200&v=4" alt="CitrineOS Logo" width="120" height="120" />
 </p>

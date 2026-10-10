@@ -10,7 +10,11 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .citrine_api import CitrineApiError, CitrineAuthError, CitrineClient
+from .citrine_api import CitrineApiError, CitrineAuthError, CitrineClient, CitrineCompatibilityError
+from .compatibility import (
+    API_PROFILES, CONF_API_PROFILE, CONF_READ_ONLY, PROFILE_LEGACY, PROFILE_V2,
+    V2_DISCOVERY_QUERY, is_read_only, normalize_v2_discovery,
+)
 from .const import (
     CONF_AUTH_TOKEN,
     CONF_BASE_URL,
@@ -106,6 +110,8 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self._async_validate(user_input)
             except CitrineAuthError:
                 errors["base"] = "invalid_auth"
+            except CitrineCompatibilityError:
+                errors["base"] = "incompatible_api"
             except (CitrineApiError, HasuraError):
                 errors["base"] = "cannot_connect"
             else:
@@ -114,6 +120,11 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
                 self._abort_if_unique_id_configured()
                 self._user_data = dict(user_input)
+                if is_read_only(user_input):
+                    self._user_data[CONF_READ_ONLY] = True
+                    return self.async_create_entry(
+                        title=user_input.get(CONF_NAME, DEFAULT_NAME),
+                        data=self._user_data)
                 return await self.async_step_load_control()
 
         values = user_input or {}
@@ -141,6 +152,10 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     def _user_schema(values: dict[str, Any]) -> vol.Schema:
         schema: dict[Any, Any] = {}
+        schema[vol.Required(CONF_API_PROFILE, default=values.get(
+            CONF_API_PROFILE, PROFILE_LEGACY))] = selector.SelectSelector(
+                selector.SelectSelectorConfig(options=API_PROFILES))
+        schema[vol.Required(CONF_READ_ONLY, default=is_read_only(values))] = selector.BooleanSelector()
 
         def _val(k: str, default: Any = None) -> Any:
             v = values.get(k)
@@ -326,7 +341,11 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             auth_token=data.get(CONF_AUTH_TOKEN) or None,
             verify_ssl=verify_ssl,
             request_timeout=int(data[CONF_REQUEST_TIMEOUT]),
+            api_profile=data.get(CONF_API_PROFILE, PROFILE_LEGACY),
+            read_only=is_read_only(data),
         )
+        if data.get(CONF_API_PROFILE) == PROFILE_V2 and not str(data.get(CONF_HASURA_URL) or "").strip():
+            raise CitrineCompatibilityError("CitrineOS 2.x requires a Hasura URL")
         await client.ping()
 
         hasura_url = data.get(CONF_HASURA_URL) or ""
@@ -335,11 +354,20 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 session,
                 url=hasura_url,
                 token=data.get(CONF_HASURA_TOKEN) or None,
+                bearer_auth=data.get(CONF_API_PROFILE) == PROFILE_V2,
                 request_timeout=int(data[CONF_REQUEST_TIMEOUT]),
                 verify_ssl=verify_ssl,
             )
             try:
-                await hasura_client.ping()
+                if data.get(CONF_API_PROFILE) == PROFILE_V2:
+                    result = await hasura_client.query(
+                        V2_DISCOVERY_QUERY, variables={"tenantId": int(data[CONF_TENANT_ID])})
+                    try:
+                        normalize_v2_discovery(result, int(data[CONF_TENANT_ID]))
+                    except ValueError as err:
+                        raise CitrineCompatibilityError(str(err)) from err
+                else:
+                    await hasura_client.ping()
             except HasuraAuthError as err:
                 raise CitrineAuthError(str(err)) from err
 
@@ -357,6 +385,7 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
 
     def _options_schema(self, values: dict[str, Any]) -> vol.Schema:
         schema: dict[Any, Any] = {}
+        schema[vol.Required(CONF_READ_ONLY, default=is_read_only(values))] = selector.BooleanSelector()
 
         def _val(k: str, default: Any = None) -> Any:
             v = values.get(k)
@@ -516,6 +545,8 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
+            if self._config_entry.data.get(CONF_API_PROFILE) == PROFILE_V2:
+                user_input = {**user_input, CONF_READ_ONLY: True}
             return self.async_create_entry(title="", data=user_input)
 
         entry_vals = {**self._config_entry.data, **self._config_entry.options}
@@ -523,4 +554,3 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=self._options_schema(entry_vals),
         )
-

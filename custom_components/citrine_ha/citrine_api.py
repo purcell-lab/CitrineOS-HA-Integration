@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
+from .compatibility import PROFILE_LEGACY, PROFILE_V2
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,6 +24,13 @@ class CitrineApiError(Exception):
 
 class CitrineAuthError(CitrineApiError):
     """Authentication failed."""
+
+class CitrineCompatibilityError(CitrineApiError):
+    """Server API or security contract does not match the selected profile."""
+
+
+class CitrineReadOnlyError(CitrineApiError):
+    """Control is disabled for this entry."""
 
 
 class CitrineClient:
@@ -36,6 +44,8 @@ class CitrineClient:
         auth_token: str | None,
         verify_ssl: bool,
         request_timeout: int,
+        api_profile: str = PROFILE_LEGACY,
+        read_only: bool = False,
     ) -> None:
         self._session = session
         self._base_url = base_url.rstrip("/")
@@ -43,6 +53,10 @@ class CitrineClient:
         self._auth_token = auth_token
         self._verify_ssl = verify_ssl
         self._request_timeout = request_timeout
+        if api_profile not in (PROFILE_LEGACY, PROFILE_V2):
+            raise CitrineCompatibilityError("Unsupported API profile")
+        self.api_profile = api_profile
+        self.read_only = read_only or api_profile == PROFILE_V2
 
     @staticmethod
     def normalize_protocol(protocol: str | None) -> str:
@@ -60,8 +74,27 @@ class CitrineClient:
         return "ocpp2.0.1"
 
     async def ping(self) -> None:
-        """Validate API reachability and credentials."""
-        await self._request("GET", "/data/ocpprouter/systemConfig")
+        """Validate readiness separately from protected read access."""
+        if self.api_profile == PROFILE_LEGACY:
+            await self._request("GET", "/data/ocpprouter/systemConfig")
+            return
+        health = await self._request("GET", "/health/ready")
+        if not isinstance(health, dict) or health.get("status") != "pass":
+            raise CitrineCompatibilityError("CitrineOS is not ready")
+        if not self._auth_token:
+            raise CitrineAuthError("The 2.x profile requires an API bearer token")
+        # A public health endpoint does not establish authentication. Verify a
+        # read-only protected route rejects anonymous access before using a token.
+        params = {"tenantId": self._tenant_id}
+        try:
+            await self._request("GET", "/commands/tariff", params=params, send_auth=False)
+        except CitrineAuthError:
+            pass
+        else:
+            raise CitrineCompatibilityError("API protected read permits anonymous access")
+        rows = await self._request("GET", "/commands/tariff", params=params)
+        if not isinstance(rows, list):
+            raise CitrineCompatibilityError("Unexpected protected-read response")
 
     async def get_charging_stations(self) -> list[dict[str, Any]]:
         """Fetch charging stations directly from CitrineOS REST data endpoints."""
@@ -74,12 +107,8 @@ class CitrineClient:
             "/data/configuration/chargingStations",
             "/data/chargingStations",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            _LOGGER.debug("REST charging stations query failed: %s", err)
-            return []
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def get_connectors(self) -> list[dict[str, Any]]:
         """Fetch connectors/EVSEs directly from CitrineOS REST data endpoints."""
@@ -92,12 +121,8 @@ class CitrineClient:
             "/data/configuration/connectors",
             "/data/connectors",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            _LOGGER.debug("REST connectors query failed: %s", err)
-            return []
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def get_transactions(self, *, limit: int = 500) -> list[dict[str, Any]]:
         """Fetch active/recent transactions directly from CitrineOS REST data endpoints."""
@@ -108,15 +133,13 @@ class CitrineClient:
             "/data/transactions/activeTransactions",
             "/data/transaction",
         ]
-        try:
-            resp = await self._request_with_fallback_paths("GET", paths, params=params)
-            return self._extract_items_from_response(resp)
-        except CitrineApiError as err:
-            _LOGGER.debug("REST transactions query failed: %s", err)
-            return []
+        resp = await self._request_with_fallback_paths("GET", paths, params=params)
+        return self._validated_collection(resp)
 
     async def discover_chargers_rest(self) -> dict[str, Any]:
         """Perform full discovery via CitrineOS REST endpoints (no Hasura required)."""
+        if self.api_profile == PROFILE_V2:
+            raise CitrineCompatibilityError("CitrineOS 2.x discovery requires Hasura")
         stations = await self.get_charging_stations()
         connectors = await self.get_connectors()
         transactions = await self.get_transactions()
@@ -125,6 +148,21 @@ class CitrineClient:
             "connectors": connectors,
             "transactions": transactions,
         }
+
+    @staticmethod
+    def _validated_collection(response: Any) -> list[dict[str, Any]]:
+        candidate = response
+        if isinstance(response, dict):
+            for key in ("data", "items", "rows", "chargingStations", "connectors", "transactions"):
+                if key in response:
+                    candidate = response[key]
+                    break
+            else:
+                if any(key in response for key in ("id", "stationId", "identifier")):
+                    candidate = [response]
+        if not isinstance(candidate, list) or any(not isinstance(row, dict) for row in candidate):
+            raise CitrineCompatibilityError("Invalid discovery collection")
+        return candidate
 
     @staticmethod
     def _extract_items_from_response(response: Any) -> list[dict[str, Any]]:
@@ -824,9 +862,12 @@ class CitrineClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        send_auth: bool = True,
     ) -> Any:
+        if self.read_only and method.upper() not in ("GET", "HEAD"):
+            raise CitrineReadOnlyError("Read-only entry: station commands are disabled")
         headers: dict[str, str] = {}
-        if self._auth_token:
+        if self._auth_token and send_auth:
             headers["Authorization"] = f"Bearer {self._auth_token}"
 
         url = f"{self._base_url}{path}"
@@ -841,6 +882,7 @@ class CitrineClient:
                 headers=headers,
                 ssl=self._verify_ssl,
                 timeout=timeout,
+                allow_redirects=False,
             ) as resp:
                 if resp.status in (401, 403):
                     raise CitrineAuthError("Authentication or authorization failed")
@@ -848,21 +890,25 @@ class CitrineClient:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise CitrineApiError(
-                        f"Citrine API {method} {path} failed ({resp.status}): {text}"
+                        f"Citrine API {method} {path} failed ({resp.status})"
                     )
+                if 300 <= resp.status < 400:
+                    raise CitrineApiError("Citrine API redirect refused")
 
                 if not text:
                     return None
 
                 content_type = resp.headers.get("Content-Type", "")
-                if "application/json" in content_type:
+                if "application/json" in content_type or "+json" in content_type:
                     return await resp.json()
 
                 return text
         except asyncio.TimeoutError as err:
             raise CitrineApiError(f"Citrine API timeout calling {path}") from err
         except aiohttp.ClientError as err:
-            raise CitrineApiError(f"Citrine API transport error: {err}") from err
+            raise CitrineApiError("Citrine API transport error") from err
+        except ValueError as err:
+            raise CitrineApiError("Invalid Citrine API JSON response") from err
 
     async def _request_with_fallback_paths(
         self,
