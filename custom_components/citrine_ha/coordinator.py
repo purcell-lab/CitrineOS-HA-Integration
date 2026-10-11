@@ -93,20 +93,21 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             rows = normalize_v2_discovery(result, tenant_id)
             merged = self._merge_station_state(**rows)
             if self._entry_data.get(CONF_API_PROFILE) == PROFILE_LAB:
-                from .lab_control import STATION
                 from .lab_telemetry import fetch_meter
+                lab_station = self._citrine_client.station
                 for station in merged:
-                    if station["id"] == STATION:
+                    if station["id"] == lab_station:
                         station["lab_meter"] = await fetch_meter(self._hasura_client, station, tenant_id)
                         self._citrine_client.observe_transaction(station)
             self._refresh_station_caches(merged)
             # Protocol is not a capability declaration. Keep all unverified
             # stations read-only, even in an entry with scoped lab controls.
-            from .lab_control import STATION, PROTOCOL
+            from .lab_control import PROTOCOL
+            lab_station = getattr(self._citrine_client, "station", None)
             for station in merged:
                 allowed = (self._entry_data.get(CONF_API_PROFILE) == PROFILE_LAB
                            and not self._citrine_client.read_only
-                           and station["id"] == STATION and station.get("protocol") == PROTOCOL)
+                           and station["id"] == lab_station and station.get("protocol") == PROTOCOL)
                 self._capability_cache[station["id"]] = {
                     "supports_remote_start": allowed, "supports_remote_stop": allowed,
                     "supports_set_charging_profile": allowed,
