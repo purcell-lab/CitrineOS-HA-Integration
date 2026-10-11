@@ -39,7 +39,7 @@ from .const import (
 )
 from .hasura_client import HasuraAuthError, HasuraClient, HasuraError
 from .compatibility import (
-    CONF_API_PROFILE, PROFILE_V2, V2_DISCOVERY_QUERY, normalize_v2_discovery,
+    CONF_API_PROFILE, PROFILE_V2, PROFILE_LAB, V2_PROFILES, V2_DISCOVERY_QUERY, normalize_v2_discovery,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(str(err)) from err
 
     async def _fetch_discovery(self, tenant_id: int) -> dict[str, Any]:
-        if self._entry_data.get(CONF_API_PROFILE) == PROFILE_V2:
+        if self._entry_data.get(CONF_API_PROFILE) in V2_PROFILES:
             if not self._hasura_client:
                 raise ValueError("CitrineOS 2.x requires Hasura discovery")
             await self._citrine_client.ping()
@@ -92,9 +92,32 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 V2_DISCOVERY_QUERY, variables={"tenantId": tenant_id})
             rows = normalize_v2_discovery(result, tenant_id)
             merged = self._merge_station_state(**rows)
+            if self._entry_data.get(CONF_API_PROFILE) == PROFILE_LAB:
+                from .lab_control import STATION
+                from .lab_telemetry import fetch_meter
+                for station in merged:
+                    if station["id"] == STATION:
+                        station["lab_meter"] = await fetch_meter(self._hasura_client, station, tenant_id)
+                        self._citrine_client.observe_transaction(station)
             self._refresh_station_caches(merged)
+            # Protocol is not a capability declaration. Keep all unverified
+            # stations read-only, even in an entry with scoped lab controls.
+            from .lab_control import STATION, PROTOCOL
+            for station in merged:
+                allowed = (self._entry_data.get(CONF_API_PROFILE) == PROFILE_LAB
+                           and not self._citrine_client.read_only
+                           and station["id"] == STATION and station.get("protocol") == PROTOCOL)
+                self._capability_cache[station["id"]] = {
+                    "supports_remote_start": allowed, "supports_remote_stop": allowed,
+                    "supports_set_charging_profile": allowed,
+                    "supports_clear_charging_profile": allowed,
+                    "supports_bidirectional_power_transfer": allowed,
+                    "supports_ems_profile_control": False,
+                    "ems_profile_support_reason": "Automatic site controller disabled",
+                    "capability_evidence": "scoped_lab_policy" if allowed else "not_verified",
+                }
             return {**rows, "stations": merged, "source": "hasura_v2",
-                    "read_only": True,
+                    "read_only": self._citrine_client.read_only,
                     "api_access": "protected_read_verified",
                     "station_control": "not_verified",
                     "intake_telemetry": self._telemetry_defaults(tenant_id, None)}
@@ -333,7 +356,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         limit: int | None = None,
     ) -> dict[str, Any]:
         fetched_at = datetime.now(UTC).isoformat()
-        if self._entry_data.get(CONF_API_PROFILE) == PROFILE_V2:
+        if self._entry_data.get(CONF_API_PROFILE) in V2_PROFILES:
             result = self._telemetry_defaults(tenant_id, site_id)
             result["error"] = "EMS intake telemetry is not supported by the 2.x read-only profile"
             return result

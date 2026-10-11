@@ -65,7 +65,8 @@ from .const import (
 )
 from .coordinator import CitrineCoordinator
 from .hasura_client import HasuraClient
-from .compatibility import CONF_API_PROFILE, PROFILE_LEGACY, PROFILE_V2, is_read_only
+from .compatibility import CONF_API_PROFILE, CONF_COMMAND_TOKEN, PROFILE_LEGACY, PROFILE_LAB, V2_PROFILES, is_read_only
+from .lab_control import ScopedLabClient
 from .load_controller import CitrineLoadController
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,28 +80,32 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CitrineOS from a config entry."""
-    verify_ssl = bool(entry.data.get(CONF_VERIFY_SSL, True))
+    values = {**entry.data, **entry.options}
+    verify_ssl = bool(values.get(CONF_VERIFY_SSL, True))
     session = async_get_clientsession(hass, verify_ssl=verify_ssl)
 
-    client = CitrineClient(
+    client_type = ScopedLabClient if values.get(CONF_API_PROFILE) == PROFILE_LAB else CitrineClient
+    lab_args = {"command_token": values.get(CONF_COMMAND_TOKEN)} if client_type is ScopedLabClient else {}
+    client = client_type(
         session,
-        base_url=entry.data[CONF_BASE_URL],
-        tenant_id=int(entry.data[CONF_TENANT_ID]),
-        auth_token=entry.data.get(CONF_AUTH_TOKEN),
+        base_url=values[CONF_BASE_URL],
+        tenant_id=int(values[CONF_TENANT_ID]),
+        auth_token=values.get(CONF_AUTH_TOKEN),
         verify_ssl=verify_ssl,
-        request_timeout=int(entry.data[CONF_REQUEST_TIMEOUT]),
-        api_profile=entry.data.get(CONF_API_PROFILE, PROFILE_LEGACY),
+        request_timeout=int(values[CONF_REQUEST_TIMEOUT]),
+        api_profile=values.get(CONF_API_PROFILE, PROFILE_LEGACY),
         read_only=is_read_only(entry.data, entry.options),
+        **lab_args,
     )
 
     hasura_client: HasuraClient | None = None
-    if entry.data.get(CONF_HASURA_URL):
+    if values.get(CONF_HASURA_URL):
         hasura_client = HasuraClient(
             session,
-            url=entry.data[CONF_HASURA_URL],
-            token=entry.data.get(CONF_HASURA_TOKEN),
-            bearer_auth=entry.data.get(CONF_API_PROFILE) == PROFILE_V2,
-            request_timeout=int(entry.data[CONF_REQUEST_TIMEOUT]),
+            url=values[CONF_HASURA_URL],
+            token=values.get(CONF_HASURA_TOKEN),
+            bearer_auth=values.get(CONF_API_PROFILE) in V2_PROFILES,
+            request_timeout=int(values[CONF_REQUEST_TIMEOUT]),
             verify_ssl=verify_ssl,
         )
 
@@ -108,7 +113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         hasura_client=hasura_client,
         citrine_client=client,
-        entry_data=dict(entry.data),
+        entry_data=values,
         entry_options=dict(entry.options),
         config_entry=entry,
     )
@@ -133,6 +138,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     platforms = ["sensor"] if client.read_only else PLATFORMS
+    if client.api_profile == PROFILE_LAB and not client.read_only:
+        platforms = ["sensor", "button", "number"]
     hass.data[DOMAIN][entry.entry_id]["platforms"] = platforms
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))

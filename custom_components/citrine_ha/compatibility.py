@@ -4,7 +4,16 @@ CONF_API_PROFILE = "api_profile"
 CONF_READ_ONLY = "read_only"
 PROFILE_LEGACY = "legacy"
 PROFILE_V2 = "v2_hasura_read_only"
-API_PROFILES = [PROFILE_LEGACY, PROFILE_V2]
+PROFILE_LAB = "v2_scoped_lab_control"
+CONF_COMMAND_TOKEN = "command_token"
+V2_PROFILES = (PROFILE_V2, PROFILE_LAB)
+API_PROFILES = [PROFILE_LEGACY, PROFILE_V2, PROFILE_LAB]
+
+
+def automatic_control_disabled(data, options=None):
+    """Manual lab controls never enable the inherited site-control loop."""
+    values = {**data, **(options or {})}
+    return values.get(CONF_API_PROFILE) == PROFILE_LAB or is_read_only(data, options)
 
 
 def is_read_only(data, options=None):

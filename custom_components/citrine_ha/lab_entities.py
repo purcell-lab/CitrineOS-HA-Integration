@@ -1,0 +1,171 @@
+"""Small, explicit manual control surface for the single enrolled simulator."""
+import voluptuous as vol
+from homeassistant.components.button import ButtonEntity
+from homeassistant.components.number import NumberEntity
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN
+from .citrine_api import CitrineApiError
+from .lab_control import STATION, PROTOCOL, PROFILE_ID, ScopedLabClient, power_period, number
+
+SERVICE = "lab_schedule"
+
+
+def station(data):
+    return next((s for s in (data or {}).get("stations", []) if s.get("id") == STATION), {})
+
+
+async def command(ctx, action, *, periods=None, duration=180):
+    c = ctx["coordinator"]
+    client = ctx["client"]
+    if not isinstance(client, ScopedLabClient) or client.read_only:
+        raise HomeAssistantError("Scoped lab controls are not enabled")
+    await c.async_request_refresh()
+    s = station(c.data)
+    if not c.last_update_success or not s.get("isOnline") or s.get("protocol") != PROTOCOL:
+        raise HomeAssistantError("Fresh online OCPP 2.1 simulator evidence is required")
+    tx = s.get("activeTransactionId")
+    try:
+        if action == "start":
+            if tx:
+                raise HomeAssistantError("The simulator already has an active transaction")
+            await client.request_start_transaction(protocol=PROTOCOL, station_id=STATION)
+        elif action == "stop":
+            if not tx:
+                raise HomeAssistantError("No active transaction to stop")
+            await client.request_stop_transaction(protocol=PROTOCOL, station_id=STATION, transaction_id=tx)
+        elif action == "clear":
+            if tx:
+                raise HomeAssistantError("Stop and verify transaction closure before profile cleanup")
+            await client.clear_charging_profile(protocol=PROTOCOL, station_id=STATION, profile_id=PROFILE_ID)
+        else:
+            if not tx:
+                raise HomeAssistantError("A current transaction is required")
+            watts = 0 if action == "zero" else ctx.get("lab_requested_w", 0)
+            await client.submit_schedule(
+                protocol=PROTOCOL, station_id=STATION, transaction_id=tx,
+                periods=periods if periods is not None else [power_period(0, watts)],
+                duration=duration)
+    except CitrineApiError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        c.async_update_listeners()
+
+
+class LabEntity(CoordinatorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, ctx, entry, key, name):
+        super().__init__(ctx["coordinator"])
+        self.ctx = ctx
+        self._attr_unique_id = f"{entry.entry_id}_{STATION}_lab_{key}"
+        self._attr_name = name
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, f"1:{STATION}")},
+            "name": "CitrineOS EVerest V2G lab",
+            "manufacturer": "EVerest",
+            "model": "Isolated simulator",
+        }
+
+    @property
+    def available(self):
+        s = station(self.coordinator.data)
+        return super().available and bool(s.get("isOnline")) and s.get("protocol") == PROTOCOL
+
+
+class LabButton(LabEntity, ButtonEntity):
+    def __init__(self, ctx, entry, action, name):
+        super().__init__(ctx, entry, action, name)
+        self.action = action
+
+    @property
+    def available(self):
+        if not super().available or self.ctx["client"].read_only:
+            return False
+        tx = station(self.coordinator.data).get("activeTransactionId")
+        return not tx if self.action in ("start", "clear") else bool(tx)
+
+    async def async_press(self):
+        await command(self.ctx, self.action)
+
+
+class LabPower(LabEntity, NumberEntity):
+    _attr_native_min_value = -11000
+    _attr_native_max_value = 11000
+    _attr_native_step = 100
+    _attr_native_unit_of_measurement = "W"
+    _attr_mode = "box"
+
+    def __init__(self, ctx, entry):
+        super().__init__(ctx, entry, "requested_power", "Requested power (apply separately)")
+
+    @property
+    def native_value(self):
+        return self.ctx.get("lab_requested_w", 0)
+
+    async def async_set_native_value(self, value):
+        if not number(value, -11000, 11000):
+            raise HomeAssistantError("Requested power must be within ±11,000 W")
+        self.ctx["lab_requested_w"] = value
+        self.async_write_ha_state()
+
+
+class LabSensor(LabEntity, SensorEntity):
+    def __init__(self, ctx, entry, key, name, unit=None):
+        super().__init__(ctx, entry, key, name)
+        self.key = key
+        self._attr_native_unit_of_measurement = unit
+
+    @property
+    def native_value(self):
+        s = station(self.coordinator.data)
+        if self.key == "command":
+            return self.ctx["client"].last_command["state"]
+        if self.key == "transaction":
+            return s.get("activeTransactionId")
+        if self.key == "protocol":
+            return s.get("protocol")
+        if self.key == "status":
+            return ", ".join(str(c.get("status", "unknown")) for c in s.get("connectors", [])) or "unknown"
+        return s.get("lab_meter", {}).get(self.key)
+
+    @property
+    def extra_state_attributes(self):
+        if self.key == "command":
+            return dict(self.ctx["client"].last_command)
+        return {k: v for k, v in station(self.coordinator.data).get("lab_meter", {}).items()
+                if k not in ("power_w", "import_kwh", "export_kwh")}
+
+
+async def setup_lab(hass, entry, add_entities, platform):
+    ctx = hass.data[DOMAIN][entry.entry_id]
+    if platform == "button":
+        add_entities([LabButton(ctx, entry, action, name) for action, name in (
+            ("start", "Start charging"), ("stop", "Stop transaction"),
+            ("apply", "Apply requested power"), ("zero", "Request zero power"),
+            ("clear", "Clear test profile after closure"))])
+        if not hass.services.has_service(DOMAIN, SERVICE):
+            async def submit(call):
+                target = hass.data[DOMAIN].get(call.data["entry_id"])
+                if not target:
+                    raise HomeAssistantError("Unknown CitrineOS entry")
+                await command(target, "schedule", periods=call.data["periods"], duration=call.data["duration"])
+            hass.services.async_register(DOMAIN, SERVICE, submit, schema=vol.Schema({
+                vol.Required("entry_id"): str,
+                vol.Required("periods"): [dict],
+                vol.Optional("duration", default=240): vol.All(int, vol.Range(min=1, max=600)),
+            }))
+    elif platform == "number":
+        add_entities([LabPower(ctx, entry)])
+    else:
+        add_entities([LabSensor(ctx, entry, *spec) for spec in (
+            ("power_w", "Measured EV power", "W"),
+            ("import_kwh", "Meter energy imported to EV", "kWh"),
+            ("export_kwh", "Meter energy exported from EV", "kWh"),
+            ("transaction", "Current transaction", None),
+            ("protocol", "Observed OCPP protocol", None),
+            ("status", "Connector status", None),
+            ("command", "Command dispatch status", None),
+        )])
