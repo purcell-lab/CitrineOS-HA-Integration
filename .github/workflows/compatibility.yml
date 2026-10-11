@@ -23,9 +23,17 @@ jobs:
             apps/ocpp-server/db/hasura-metadata
           persist-credentials: false
       - run: python -m pip install homeassistant==2026.10.0 pytest==8.4.2 pytest-asyncio==1.2.0 graphql-core==3.2.6
+      - uses: actions/checkout@v4
+        with:
+          repository: purcell-lab/ha-addons
+          ref: df35b7a003256a208e0f07cfcd82c44667c41d3f
+          path: pinned-app
+          sparse-checkout: citrineos_server/rootfs
+          persist-credentials: false
       - name: Changed areas and controller regression tests
         env:
           CITRINE_SERVER_SOURCE: pinned-server
+          CITRINE_APP_SOURCE: pinned-app
         run: python -m pytest tests -q --ignore=tests/test_allocator.py
       - uses: actions/checkout@v4
         with:

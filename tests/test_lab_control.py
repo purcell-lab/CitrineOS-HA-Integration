@@ -1,5 +1,9 @@
 from datetime import UTC, datetime, timedelta
 from copy import deepcopy
+import json
+import os
+from pathlib import Path
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
@@ -31,6 +35,22 @@ def test_bounded_absolute_schedule_and_transaction():
     assert c["chargingProfilePurpose"] == "TxProfile"
     assert c["chargingProfileKind"] == "Absolute"
     assert [x["setpoint"] for x in c["chargingSchedule"][0]["chargingSchedulePeriod"]] == [6000,-5000,3000,0]
+    assert len(c["chargingSchedule"][0]["startSchedule"].split(".")[1].split("+")[0]) == 3
+
+
+def test_real_client_wire_payload_passes_pinned_gateway_policy():
+    source=os.environ.get("CITRINE_APP_SOURCE")
+    if not source:
+        pytest.skip("Set CITRINE_APP_SOURCE for the cross-repository wire contract")
+    policy_file=(Path(source)/"citrineos_server/rootfs/control-policy.mjs").resolve()
+    script="""const {validateCommand,ROUTES,STATION}=await import(process.argv[1]);
+let text='';for await(const c of process.stdin)text+=c;
+const p=JSON.parse(text);
+const u=new URL('http://lab'+ROUTES[2]+'?identifier='+STATION+'&tenantId=1');
+if(!validateCommand(u,p))process.exit(1);"""
+    payload=build_profile("uuid-session", [power_period(i*60,w) for i,w in enumerate([6000,-5000,3000,0])])
+    subprocess.run(["node","--input-type=module","-e",script,policy_file.as_uri()],
+                   input=json.dumps(payload),text=True,check=True,capture_output=True)
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "5000", -11001, 11001])

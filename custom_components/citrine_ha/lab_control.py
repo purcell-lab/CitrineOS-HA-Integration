@@ -69,7 +69,7 @@ def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_I
         "id": profile_id, "stackLevel": stack_level,
         "chargingProfilePurpose": "TxProfile", "chargingProfileKind": "Absolute",
         "transactionId": transaction_id,
-        "chargingSchedule": [{"id": profile_id, "startSchedule": start_at.isoformat(),
+        "chargingSchedule": [{"id": profile_id, "startSchedule": start_at.isoformat(timespec="milliseconds"),
                               "duration": duration, "chargingRateUnit": "W",
                               "chargingSchedulePeriod": normalized}],
     }}
