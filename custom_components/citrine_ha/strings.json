@@ -5,7 +5,8 @@
         "title": "Connect to CitrineOS",
         "description": "Configure your CitrineOS server connection and credentials.",
         "data": {
-          "api_profile": "API profile: legacy or CitrineOS 2.x with Hasura (read only)",
+          "api_profile": "API profile: legacy, 2.x read-only, or scoped simulator controls",
+          "command_token": "Separate lab command token (never the reader token)",
           "read_only": "Read only: disable station commands and MQTT control",
           "name": "Integration Name",
           "base_url": "CitrineOS Base URL (e.g. http://localhost:8080)",
@@ -53,7 +54,9 @@
         "title": "CitrineOS & Energy Controller Settings",
         "description": "Tune real-time load management, sensors, 3-phase balancing, safety limits, and charger polling.",
         "data": {
-          "read_only": "Read only (always enforced for the CitrineOS 2.x profile)",
+          "api_profile": "API profile",
+          "command_token": "Separate lab command token (leave omitted to retain)",
+          "read_only": "Read only (disable all commands)",
           "grid_power_sensor": "Grid Power Sensor (+ import / - export in Watts)",
           "grid_phase_a_current_sensor": "Grid Phase A / L1 Current Sensor (Amps)",
           "grid_phase_b_current_sensor": "Grid Phase B / L2 Current Sensor (Amps)",

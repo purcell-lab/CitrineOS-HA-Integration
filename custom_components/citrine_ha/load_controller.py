@@ -1,7 +1,7 @@
 """Local Load Controller for CitrineOS and Home Assistant."""
 
 from __future__ import annotations
-from .compatibility import is_read_only
+from .compatibility import automatic_control_disabled as is_read_only, CONF_API_PROFILE, PROFILE_LAB
 
 import asyncio
 from datetime import UTC, datetime
@@ -142,7 +142,7 @@ class CitrineLoadController:
     async def async_start(self) -> None:
         """Start the controller loop and sensor listeners."""
         if is_read_only(self.entry.data, self.entry.options):
-            self.state_status = "Read only"
+            self.state_status = ("Manual lab controls" if {**self.entry.data, **self.entry.options}.get(CONF_API_PROFILE) == PROFILE_LAB else "Read only")
             return
         interval = int(
             self.entry.options.get(CONF_CONTROLLER_INTERVAL_SECS)
@@ -227,7 +227,7 @@ class CitrineLoadController:
 
     async def _execute_control_cycle(self) -> None:
         if is_read_only(self.entry.data, self.entry.options):
-            self.state_status = "Read only"
+            self.state_status = ("Manual lab controls" if {**self.entry.data, **self.entry.options}.get(CONF_API_PROFILE) == PROFILE_LAB else "Read only")
             return
         if not self.coordinator.last_update_success:
             self.state_status = "Discovery unavailable"

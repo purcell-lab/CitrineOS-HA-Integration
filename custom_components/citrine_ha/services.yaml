@@ -349,4 +349,23 @@ emergency_safe_mode:
       required: false
       selector:
         text:
+lab_schedule:
+  name: Submit scoped lab schedule
+  description: Send one bounded OCPP 2.1 schedule to the currently active EVerest lab transaction. W only, 600 seconds maximum, no fallback or retry.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    periods:
+      required: true
+      selector:
+        object:
+    duration:
+      default: 240
+      selector:
+        number:
+          min: 1
+          max: 600
+          unit_of_measurement: s
 

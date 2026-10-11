@@ -28,6 +28,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up sensor entities from coordinator data."""
+    from .compatibility import PROFILE_LAB
+    if hass.data[DOMAIN][entry.entry_id]["client"].api_profile == PROFILE_LAB:
+        from .lab_entities import setup_lab
+        await setup_lab(hass, entry, async_add_entities, "sensor")
+        return
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: CitrineCoordinator = data["coordinator"]
     controller: CitrineLoadController = data["controller"]
@@ -970,6 +975,5 @@ class CitrinePhaseCurrentSensor(SensorEntity):
     @property
     def device_info(self) -> DeviceInfo:
         return _site_device_info(self._entry)
-
 
 
