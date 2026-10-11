@@ -207,3 +207,35 @@ def test_lifecycle_observation_does_not_claim_profile_acceptance():
     c.last_command={"action":"profile","state":"outcome_unknown"}
     c.observe_transaction(s)
     assert c.last_command["state"]=="outcome_unknown"
+
+
+@pytest.mark.asyncio
+async def test_command_station_learned_from_server_policy_and_pinned():
+    c=client()
+    assert c.station == STATION
+    other={**policy(),"station_id":"SIM-EV-EVEREST-V2G-02"}
+    c._command_client._request=AsyncMock(side_effect=[other,other,[{"success":True}]])
+    await c.control_policy()
+    assert c.station == "SIM-EV-EVEREST-V2G-02"
+    with pytest.raises(CitrineCompatibilityError):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    await c.request_start_transaction(protocol=PROTOCOL,station_id="SIM-EV-EVEREST-V2G-02")
+    method,path=c._command_client._request.await_args.args
+    assert path == PATHS["start"]
+    assert c._command_client._request.await_args.kwargs["params"] == {
+        "identifier":"SIM-EV-EVEREST-V2G-02","tenantId":1}
+    # A server that changes its command station needs a reload, not a retarget.
+    c._command_client._request=AsyncMock(return_value={**policy(),"station_id":"SIM-EV-OTHER"})
+    with pytest.raises(CitrineCompatibilityError):
+        await c.control_policy()
+    assert c.station == "SIM-EV-EVEREST-V2G-02"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("station_id",["SIM-CITRINE-LAB-01","REAL-CHARGER","SIM-EV-",None,"SIM-EV-a/b"])
+async def test_policy_station_outside_simulator_namespace_rejected(station_id):
+    c=client()
+    c._command_client._request=AsyncMock(return_value={**policy(),"station_id":station_id})
+    with pytest.raises(CitrineCompatibilityError):
+        await c.control_policy()
+    assert c.station == STATION

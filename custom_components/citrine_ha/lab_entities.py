@@ -8,13 +8,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .citrine_api import CitrineApiError
-from .lab_control import STATION, PROTOCOL, PROFILE_ID, ScopedLabClient, power_period, number
+from .lab_control import PROTOCOL, PROFILE_ID, ScopedLabClient, power_period, number
 
 SERVICE = "lab_schedule"
 
 
-def station(data):
-    return next((s for s in (data or {}).get("stations", []) if s.get("id") == STATION), {})
+def station(data, station_id):
+    return next((s for s in (data or {}).get("stations", []) if s.get("id") == station_id), {})
 
 
 async def command(ctx, action, *, periods=None, duration=180):
@@ -23,7 +23,8 @@ async def command(ctx, action, *, periods=None, duration=180):
     if not isinstance(client, ScopedLabClient) or client.read_only:
         raise HomeAssistantError("Scoped lab controls are not enabled")
     await c.async_request_refresh()
-    s = station(c.data)
+    sid = client.station
+    s = station(c.data, sid)
     if not c.last_update_success or not s.get("isOnline") or s.get("protocol") != PROTOCOL:
         raise HomeAssistantError("Fresh online OCPP 2.1 simulator evidence is required")
     tx = s.get("activeTransactionId")
@@ -31,21 +32,21 @@ async def command(ctx, action, *, periods=None, duration=180):
         if action == "start":
             if tx:
                 raise HomeAssistantError("The simulator already has an active transaction")
-            await client.request_start_transaction(protocol=PROTOCOL, station_id=STATION)
+            await client.request_start_transaction(protocol=PROTOCOL, station_id=sid)
         elif action == "stop":
             if not tx:
                 raise HomeAssistantError("No active transaction to stop")
-            await client.request_stop_transaction(protocol=PROTOCOL, station_id=STATION, transaction_id=tx)
+            await client.request_stop_transaction(protocol=PROTOCOL, station_id=sid, transaction_id=tx)
         elif action == "clear":
             if tx:
                 raise HomeAssistantError("Stop and verify transaction closure before profile cleanup")
-            await client.clear_charging_profile(protocol=PROTOCOL, station_id=STATION, profile_id=PROFILE_ID)
+            await client.clear_charging_profile(protocol=PROTOCOL, station_id=sid, profile_id=PROFILE_ID)
         else:
             if not tx:
                 raise HomeAssistantError("A current transaction is required")
             watts = 0 if action == "zero" else ctx.get("lab_requested_w", 0)
             await client.submit_schedule(
-                protocol=PROTOCOL, station_id=STATION, transaction_id=tx,
+                protocol=PROTOCOL, station_id=sid, transaction_id=tx,
                 periods=periods if periods is not None else [power_period(0, watts)],
                 duration=duration)
     except CitrineApiError as err:
@@ -60,18 +61,20 @@ class LabEntity(CoordinatorEntity):
     def __init__(self, ctx, entry, key, name):
         super().__init__(ctx["coordinator"])
         self.ctx = ctx
-        self._attr_unique_id = f"{entry.entry_id}_{STATION}_lab_{key}"
+        sid = ctx["client"].station
+        self._station_id = sid
+        self._attr_unique_id = f"{entry.entry_id}_{sid}_lab_{key}"
         self._attr_name = name
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"1:{STATION}")},
-            "name": "CitrineOS EVerest V2G lab",
+            "identifiers": {(DOMAIN, f"1:{sid}")},
+            "name": f"CitrineOS EVerest V2G lab {sid}",
             "manufacturer": "EVerest",
             "model": "Isolated simulator",
         }
 
     @property
     def available(self):
-        s = station(self.coordinator.data)
+        s = station(self.coordinator.data, self._station_id)
         return super().available and bool(s.get("isOnline")) and s.get("protocol") == PROTOCOL
 
 
@@ -84,7 +87,7 @@ class LabButton(LabEntity, ButtonEntity):
     def available(self):
         if not super().available or self.ctx["client"].read_only:
             return False
-        tx = station(self.coordinator.data).get("activeTransactionId")
+        tx = station(self.coordinator.data, self._station_id).get("activeTransactionId")
         return not tx if self.action in ("start", "clear") else bool(tx)
 
     async def async_press(self):
@@ -120,7 +123,7 @@ class LabSensor(LabEntity, SensorEntity):
 
     @property
     def native_value(self):
-        s = station(self.coordinator.data)
+        s = station(self.coordinator.data, self._station_id)
         if self.key == "command":
             return self.ctx["client"].last_command["state"]
         if self.key == "transaction":
@@ -135,7 +138,7 @@ class LabSensor(LabEntity, SensorEntity):
     def extra_state_attributes(self):
         if self.key == "command":
             return dict(self.ctx["client"].last_command)
-        return {k: v for k, v in station(self.coordinator.data).get("lab_meter", {}).items()
+        return {k: v for k, v in station(self.coordinator.data, self._station_id).get("lab_meter", {}).items()
                 if k not in ("power_w", "import_kwh", "export_kwh")}
 
 

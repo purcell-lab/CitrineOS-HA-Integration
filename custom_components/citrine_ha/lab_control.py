@@ -15,6 +15,8 @@ from .citrine_api import (
 from .compatibility import PROFILE_LAB, PROFILE_V2
 
 STATION = "SIM-EV-EVEREST-V2G-01"
+# The server names its single command station; only simulator identities.
+STATION_PATTERN = re.compile(r"SIM-EV-[A-Za-z0-9_-]{1,36}")
 PROTOCOL = "ocpp2.1"
 PROFILE_ID = 9001
 PATHS = {
@@ -97,11 +99,14 @@ class ScopedLabClient(CitrineClient):
             self._session, self._base_url, self._tenant_id, command_token,
             self._verify_ssl, self._request_timeout, read_only=self.read_only)
         self._command_lock = asyncio.Lock()
+        # Default until the server policy is read; pinned once learned.
+        self.station = STATION
+        self._station_learned = False
         self.last_command: dict[str, Any] = {"state": "not_sent"}
 
     def observe_transaction(self, station):
         """Resolve only observed lifecycle states, never invent profile acceptance."""
-        if station.get("id") != STATION or station.get("protocol") != PROTOCOL:
+        if station.get("id") != self.station or station.get("protocol") != PROTOCOL:
             return
         active = station.get("activeTransactionId")
         meter = station.get("lab_meter", {})
@@ -126,7 +131,10 @@ class ScopedLabClient(CitrineClient):
             raise CitrineReadOnlyError("Lab controls are disabled")
         p = await self._command_client._request("GET", "/lab/control-policy")
         if (not isinstance(p, dict) or p.get("can_control") is not True
-                or p.get("station_id") != STATION or p.get("protocol") != PROTOCOL
+                or not isinstance(p.get("station_id"), str)
+                or not STATION_PATTERN.fullmatch(p["station_id"])
+                or (self._station_learned and p["station_id"] != self.station)
+                or p.get("protocol") != PROTOCOL
                 or p.get("max_import_w") != 11000 or p.get("max_export_w") != 11000
                 or p.get("max_profile_seconds") != 600 or p.get("max_periods") != 10
                 or p.get("automatic_control") is not False
@@ -134,6 +142,9 @@ class ScopedLabClient(CitrineClient):
                 or p.get("real_devices_enabled") is not False
                 or set(p.get("commands", [])) != set(PATHS.values())):
             raise CitrineCompatibilityError("Server does not match the scoped lab policy")
+        # A changed command station needs an integration reload, never a silent retarget.
+        self.station = p["station_id"]
+        self._station_learned = True
         return p
 
     async def ping(self):
@@ -142,7 +153,7 @@ class ScopedLabClient(CitrineClient):
             await self.control_policy()
 
     async def _dispatch(self, action, payload, *, protocol, station_id):
-        if protocol != PROTOCOL or station_id != STATION:
+        if protocol != PROTOCOL or station_id != self.station:
             raise CitrineCompatibilityError("Exact enrolled simulator and observed OCPP 2.1 required")
         if self._command_lock.locked():
             raise CitrineApiError("A lab command is already in progress")
@@ -154,13 +165,13 @@ class ScopedLabClient(CitrineClient):
             await self.control_policy()
             self.last_command = {"action": action, "state": "dispatching",
                                  "dispatched_at": datetime.now(UTC).isoformat(),
-                                 "station_id": STATION}
+                                 "station_id": self.station}
             tx = payload.get("transactionId") or payload.get("chargingProfile", {}).get("transactionId")
             if tx:
                 self.last_command["transaction_id"] = tx
             try:
                 response = await self._command_client._request(
-                    "POST", PATHS[action], params={"identifier": STATION, "tenantId": 1}, json=payload)
+                    "POST", PATHS[action], params={"identifier": self.station, "tenantId": 1}, json=payload)
             except CitrineApiError:
                 self.last_command.update(state="outcome_unknown",
                                          detail="Reconcile the station before another command; no automatic retry.")
