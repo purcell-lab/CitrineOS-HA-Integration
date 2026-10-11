@@ -99,6 +99,22 @@ class ScopedLabClient(CitrineClient):
         self._command_lock = asyncio.Lock()
         self.last_command: dict[str, Any] = {"state": "not_sent"}
 
+    def observe_transaction(self, station):
+        """Resolve only observed lifecycle states, never invent profile acceptance."""
+        if station.get("id") != STATION or station.get("protocol") != PROTOCOL:
+            return
+        active = station.get("activeTransactionId")
+        meter = station.get("lab_meter", {})
+        action = self.last_command.get("action")
+        if action == "start" and active:
+            self.last_command.update(state="transaction_observed", transaction_id=active,
+                                     observed_at=datetime.now(UTC).isoformat())
+        elif (action == "stop" and not active
+              and meter.get("transaction_closed") is True
+              and meter.get("meter_transaction_id") == self.last_command.get("transaction_id")):
+            self.last_command.update(state="transaction_closure_observed",
+                                     observed_at=datetime.now(UTC).isoformat())
+
     async def _request(self, method, path, **kwargs):
         # Any inherited legacy operation fails before network I/O.
         if method.upper() not in ("GET", "HEAD"):
@@ -139,6 +155,9 @@ class ScopedLabClient(CitrineClient):
             self.last_command = {"action": action, "state": "dispatching",
                                  "dispatched_at": datetime.now(UTC).isoformat(),
                                  "station_id": STATION}
+            tx = payload.get("transactionId") or payload.get("chargingProfile", {}).get("transactionId")
+            if tx:
+                self.last_command["transaction_id"] = tx
             try:
                 response = await self._command_client._request(
                     "POST", PATHS[action], params={"identifier": STATION, "tenantId": 1}, json=payload)

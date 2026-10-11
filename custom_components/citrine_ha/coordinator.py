@@ -98,6 +98,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for station in merged:
                     if station["id"] == STATION:
                         station["lab_meter"] = await fetch_meter(self._hasura_client, station, tenant_id)
+                        self._citrine_client.observe_transaction(station)
             self._refresh_station_caches(merged)
             # Protocol is not a capability declaration. Keep all unverified
             # stations read-only, even in an entry with scoped lab controls.

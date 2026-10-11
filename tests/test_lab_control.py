@@ -168,3 +168,22 @@ async def test_ui_never_clears_active_profile():
     with pytest.raises(HomeAssistantError,match="closure"):
         await command({"client":c,"coordinator":coordinator},"clear")
     c.clear_charging_profile.assert_not_called()
+
+
+def test_lifecycle_observation_does_not_claim_profile_acceptance():
+    c=client()
+    c.last_command={"action":"start","state":"dispatched_awaiting_station_evidence"}
+    s={"id":STATION,"protocol":PROTOCOL,"activeTransactionId":"t"}
+    c.observe_transaction(s)
+    assert c.last_command["state"]=="transaction_observed"
+    assert c.last_command["transaction_id"]=="t"
+    c.last_command={"action":"stop","state":"outcome_unknown","transaction_id":"t"}
+    s.update(activeTransactionId=None,lab_meter={"transaction_closed":True,"meter_transaction_id":"other"})
+    c.observe_transaction(s)
+    assert c.last_command["state"]=="outcome_unknown"
+    s["lab_meter"]["meter_transaction_id"]="t"
+    c.observe_transaction(s)
+    assert c.last_command["state"]=="transaction_closure_observed"
+    c.last_command={"action":"profile","state":"outcome_unknown"}
+    c.observe_transaction(s)
+    assert c.last_command["state"]=="outcome_unknown"
