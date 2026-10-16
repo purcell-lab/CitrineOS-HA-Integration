@@ -45,6 +45,18 @@ from .compatibility import (
 _LOGGER = logging.getLogger(__name__)
 
 
+
+def scan_interval_seconds(entry_data: dict[str, Any], entry_options: dict[str, Any]) -> int:
+    """Polling interval: the options value, else the value chosen at setup.
+
+    The setup form stores scan_interval in the entry data; reading only the
+    options made a new entry poll at the 30 s default whatever was chosen.
+    """
+    value = entry_options.get(CONF_SCAN_INTERVAL)
+    if value is None:
+        value = entry_data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    return max(1, int(value))
+
 class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Data coordinator for discovered charging stations."""
 
@@ -58,7 +70,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entry_options: dict[str, Any],
         config_entry: ConfigEntry | None = None,
     ) -> None:
-        scan_interval = entry_options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        scan_interval = scan_interval_seconds(entry_data, entry_options)
         super().__init__(
             hass,
             _LOGGER,

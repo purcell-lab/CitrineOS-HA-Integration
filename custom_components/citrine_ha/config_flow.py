@@ -235,7 +235,7 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_SCAN_INTERVAL,
             default=_int(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
         )] = selector.NumberSelector(
-            selector.NumberSelectorConfig(min=5, max=3600, step=5, mode=selector.NumberSelectorMode.BOX)
+            selector.NumberSelectorConfig(min=1, max=3600, step=1, mode=selector.NumberSelectorMode.BOX)
         )
 
         schema[vol.Optional(
@@ -399,7 +399,7 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(CONF_COMMAND_TOKEN): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
                 vol.Optional(CONF_SCAN_INTERVAL, default=values.get(CONF_SCAN_INTERVAL, 10)):
-                    selector.NumberSelector(selector.NumberSelectorConfig(min=5, max=60, step=1)),
+                    selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=60, step=1)),
             })
         schema: dict[Any, Any] = {}
         schema[vol.Required(CONF_READ_ONLY, default=is_read_only(values))] = selector.BooleanSelector()
