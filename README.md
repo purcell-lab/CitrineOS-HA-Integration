@@ -108,7 +108,7 @@ A pre-configured Lovelace dashboard view is available in [assets/dashboard.yaml]
 - SSL verify toggle
 - Request timeout
 - Optional Hasura URL/token/query
-- Discovery scan interval
+- Discovery scan interval (1 to 3600 s; 1 to 60 s in the v2 options). The value chosen at setup is used until the options change it.
 - Default idTag and EVSE id for quick start commands
 
 2. Discovery and entities
