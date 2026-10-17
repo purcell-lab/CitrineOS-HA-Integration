@@ -9,7 +9,7 @@ import pytest
 
 from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineReadOnlyError
 from custom_components.citrine_ha.compatibility import PROFILE_LAB, automatic_control_disabled
-from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period
+from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period
 from custom_components.citrine_ha.lab_telemetry import parse_meter
 from custom_components.citrine_ha.lab_entities import setup_lab, command
 from custom_components.citrine_ha.config_flow import CitrineOptionsFlow
@@ -49,6 +49,53 @@ const p=JSON.parse(text);
 const u=new URL('http://lab'+ROUTES[2]+'?identifier='+STATION+'&tenantId=1');
 if(!validateCommand(u,p))process.exit(1);"""
     payload=build_profile("uuid-session", [power_period(i*60,w) for i,w in enumerate([6000,-5000,3000,0])])
+    subprocess.run(["node","--input-type=module","-e",script,policy_file.as_uri()],
+                   input=json.dumps(payload),text=True,check=True,capture_output=True)
+
+
+def test_ac_charging_only_limits_and_phases():
+    periods=[charge_period(0,7000,1),charge_period(60,3000),{"startPeriod":120,"limit":0,"numberPhases":1,"phaseToUse":2}]
+    sched=build_profile("t",periods)["chargingProfile"]["chargingSchedule"][0]["chargingSchedulePeriod"]
+    assert sched==periods
+    assert all("setpoint" not in x and "operationMode" not in x for x in sched)
+
+
+@pytest.mark.parametrize("bad", [
+    {"startPeriod":0,"limit":11001},
+    {"startPeriod":0,"limit":1000,"numberPhases":2},
+    {"startPeriod":0,"limit":1000,"phaseToUse":1},
+    {"startPeriod":0,"limit":1000,"numberPhases":3,"phaseToUse":1},
+    {"startPeriod":0,"limit":1000,"setpoint":500},
+    {"startPeriod":0,"limit":1000,"operationMode":"ChargingOnly"},
+    {"startPeriod":0,"limit":1000,"dischargeLimit":0},
+])
+def test_invalid_charging_only_periods_rejected(bad):
+    with pytest.raises(CitrineCompatibilityError):
+        build_profile("t",[bad])
+
+
+def test_immediate_start_leaves_no_gap():
+    before=datetime.now(UTC)
+    p=build_profile("t",[charge_period(0,5000,1)],immediate=True)
+    start=datetime.fromisoformat(p["chargingProfile"]["chargingSchedule"][0]["startSchedule"])
+    assert before-timedelta(seconds=3)<start<=before
+    with pytest.raises(CitrineCompatibilityError):
+        build_profile("t",[charge_period(0,5000)],immediate=True,start_at=datetime.now(UTC)+timedelta(seconds=5))
+    with pytest.raises(CitrineCompatibilityError):
+        build_profile("t",[charge_period(0,5000)],immediate=1)
+
+
+def test_charging_only_wire_payload_passes_pinned_gateway_policy():
+    source=os.environ.get("CITRINE_APP_SOURCE")
+    if not source:
+        pytest.skip("Set CITRINE_APP_SOURCE for the cross-repository wire contract")
+    policy_file=(Path(source)/"citrineos_server/rootfs/control-policy.mjs").resolve()
+    script="""const {validateCommand,ROUTES,STATION}=await import(process.argv[1]);
+let text='';for await(const c of process.stdin)text+=c;
+const p=JSON.parse(text);
+const u=new URL('http://lab'+ROUTES[2]+'?identifier='+STATION+'&tenantId=1');
+if(!validateCommand(u,p))process.exit(1);"""
+    payload=build_profile("uuid-session",[charge_period(0,7000,1),charge_period(60,0,1)],immediate=True)
     subprocess.run(["node","--input-type=module","-e",script,policy_file.as_uri()],
                    input=json.dumps(payload),text=True,check=True,capture_output=True)
 
