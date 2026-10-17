@@ -19,11 +19,12 @@ STATION = "SIM-EV-EVEREST-V2G-01"
 STATION_PATTERN = re.compile(r"SIM-EV-[A-Za-z0-9_-]{1,36}")
 PROTOCOL = "ocpp2.1"
 PROFILE_ID = 9001
-# Charging (import) per period; the server raised it from 11 kW to 23 kW in
-# citrineos_server 0.5.3 for a 3-phase 32 A AC simulator. V2G discharge stays 11 kW.
-MAX_IMPORT_W = 23000
-MAX_EXPORT_W = 11000
-KNOWN_IMPORT_W = (11000, MAX_IMPORT_W)
+# Lab bounds per period, charging (import) and V2G discharge (export).
+# citrineos_server 0.5.3 raised both from 11 kW to 25 kW for a 3-phase 32 A
+# AC simulator; older servers still report 11 kW.
+MAX_IMPORT_W = 25000
+MAX_EXPORT_W = 25000
+KNOWN_BOUNDS = ((11000, 11000), (MAX_IMPORT_W, MAX_EXPORT_W))
 PATHS = {
     "start": "/ocpp/2.1/evdriver/requestStartTransaction",
     "stop": "/ocpp/2.1/evdriver/requestStopTransaction",
@@ -115,7 +116,11 @@ def charge_period(offset, watts, number_phases=None):
 
 
 def power_period(offset, watts):
-    return {"startPeriod": offset, "limit": 11000, "dischargeLimit": -11000,
+    # Bounds stay at 11 kW (what older servers accept) and widen only for a
+    # setpoint beyond them, up to the 25 kW lab bound.
+    valid = number(watts, -MAX_EXPORT_W, MAX_IMPORT_W)
+    return {"startPeriod": offset, "limit": max(11000, watts) if valid else 11000,
+            "dischargeLimit": min(-11000, watts) if valid else -11000,
             "setpoint": watts, "operationMode": "CentralSetpoint"}
 
 
@@ -172,7 +177,7 @@ class ScopedLabClient(CitrineClient):
                 or not STATION_PATTERN.fullmatch(p["station_id"])
                 or (self._station_learned and p["station_id"] != self.station)
                 or p.get("protocol") != PROTOCOL
-                or p.get("max_import_w") not in KNOWN_IMPORT_W or p.get("max_export_w") != MAX_EXPORT_W
+                or (p.get("max_import_w"), p.get("max_export_w")) not in KNOWN_BOUNDS
                 or p.get("max_profile_seconds") != 600 or p.get("max_periods") != 10
                 or p.get("automatic_control") is not False
                 or p.get("clear_requires_closed_transaction") is not True

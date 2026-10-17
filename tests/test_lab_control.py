@@ -61,7 +61,7 @@ def test_ac_charging_only_limits_and_phases():
 
 
 @pytest.mark.parametrize("bad", [
-    {"startPeriod":0,"limit":23001},
+    {"startPeriod":0,"limit":25001},
     {"startPeriod":0,"limit":1000,"numberPhases":2},
     {"startPeriod":0,"limit":1000,"phaseToUse":1},
     {"startPeriod":0,"limit":1000,"numberPhases":3,"phaseToUse":1},
@@ -100,7 +100,7 @@ if(!validateCommand(u,p))process.exit(1);"""
                    input=json.dumps(payload),text=True,check=True,capture_output=True)
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "5000", -11001, 11001])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "5000", -25001, 25001])
 def test_invalid_setpoints_rejected(bad):
     with pytest.raises(CitrineCompatibilityError):
         build_profile("t", [power_period(0,bad)])
@@ -156,21 +156,37 @@ async def test_ambiguous_dispatch_response_is_not_success(response):
     assert c.last_command["state"]=="dispatch_not_confirmed"
 
 
-def test_three_phase_ac_limit_up_to_23_kw():
+def test_power_period_keeps_11_kw_bounds_unless_setpoint_exceeds():
+    assert power_period(0,6000)["limit"]==11000 and power_period(0,-6000)["dischargeLimit"]==-11000
+    assert power_period(0,20000)["limit"]==20000 and power_period(0,-20000)["dischargeLimit"]==-20000
+    build_profile("t",[power_period(0,25000),power_period(60,-25000)])
+
+
+def test_three_phase_ac_and_v2g_limits_up_to_25_kw():
     sched=build_profile("t",[charge_period(0,22080,3)])["chargingProfile"]["chargingSchedule"][0]
     assert sched["chargingSchedulePeriod"][0]["limit"]==22080
+    build_profile("t",[{"startPeriod":0,"limit":25000,"dischargeLimit":-25000,"setpoint":-25000,"operationMode":"CentralSetpoint"}])
     with pytest.raises(CitrineCompatibilityError):
-        build_profile("t",[charge_period(0,23001,3)])
+        build_profile("t",[charge_period(0,25001,3)])
     with pytest.raises(CitrineCompatibilityError):
-        build_profile("t",[{"startPeriod":0,"limit":20000,"dischargeLimit":-11001,"setpoint":0,"operationMode":"CentralSetpoint"}])
+        build_profile("t",[{"startPeriod":0,"limit":20000,"dischargeLimit":-25001,"setpoint":0,"operationMode":"CentralSetpoint"}])
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("max_import", [11000, 23000])
-async def test_policy_accepts_old_and_raised_import_bound(max_import):
-    c=client();p=policy();p["max_import_w"]=max_import
+@pytest.mark.parametrize("bounds", [(11000, 11000), (25000, 25000)])
+async def test_policy_accepts_old_and_raised_bounds(bounds):
+    c=client();p=policy();p["max_import_w"],p["max_export_w"]=bounds
     c._command_client._request=AsyncMock(return_value=p)
-    assert (await c.control_policy())["max_import_w"]==max_import
+    assert (await c.control_policy())["max_export_w"]==bounds[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bounds", [(25000, 11000), (11000, 25000), (23000, 11000)])
+async def test_policy_rejects_mixed_bounds(bounds):
+    c=client();p=policy();p["max_import_w"],p["max_export_w"]=bounds
+    c._command_client._request=AsyncMock(return_value=p)
+    with pytest.raises(CitrineCompatibilityError):
+        await c.control_policy()
 
 
 @pytest.mark.asyncio
