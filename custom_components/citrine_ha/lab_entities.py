@@ -1,6 +1,7 @@
 """Small, explicit manual control surface for the single enrolled command station."""
 import voluptuous as vol
 from homeassistant.components.button import ButtonEntity
+from homeassistant.core import SupportsResponse
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.exceptions import HomeAssistantError
@@ -12,6 +13,7 @@ from .lab_control import (PROFILE_ID, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTER
                           power_period, number)
 
 SERVICE = "lab_schedule"
+SERVICE_RECONCILE = "lab_reconcile"
 
 
 def station(data, station_id):
@@ -24,6 +26,10 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False):
     if not isinstance(client, ScopedLabClient) or client.read_only:
         raise HomeAssistantError("Scoped lab controls are not enabled")
     await c.async_request_refresh()
+    if not client.csms_available:
+        raise HomeAssistantError(
+            f"CSMS unavailable ({client.csms_unavailable_reason}); lab commands are blocked "
+            "until /health/ready passes")
     sid = client.station
     s = station(c.data, sid)
     protocol = s.get("protocol")
@@ -52,6 +58,26 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False):
                 protocol=protocol, station_id=sid, transaction_id=tx,
                 periods=periods if periods is not None else [power_period(0, watts)],
                 duration=duration, immediate=immediate)
+    except CitrineApiError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        c.async_update_listeners()
+
+
+async def reconcile(ctx):
+    """Re-read the CSMS now and resolve an unresolved or awaiting command outcome."""
+    c = ctx["coordinator"]
+    client = ctx["client"]
+    if not isinstance(client, ScopedLabClient) or client.read_only:
+        raise HomeAssistantError("Scoped lab controls are not enabled")
+    # Not the debounced request: reconcile needs state read after the call.
+    await c.async_refresh()
+    try:
+        client.require_csms()
+        s = station(c.data, client.station)
+        if not c.last_update_success or not s:
+            raise HomeAssistantError(f"Fresh CSMS evidence for {client.station} is required to reconcile")
+        return await client.reconcile(s)
     except CitrineApiError as err:
         raise HomeAssistantError(str(err)) from err
     finally:
@@ -90,12 +116,19 @@ class LabButton(LabEntity, ButtonEntity):
 
     @property
     def available(self):
+        if self.action == "reconcile":
+            # Reconcile reads the CSMS record; it does not need the station online.
+            return (CoordinatorEntity.available.fget(self) and not self.ctx["client"].read_only
+                    and bool(station(self.coordinator.data, self._station_id)))
         if not super().available or self.ctx["client"].read_only:
             return False
         tx = station(self.coordinator.data, self._station_id).get("activeTransactionId")
         return not tx if self.action in ("start", "clear") else bool(tx)
 
     async def async_press(self):
+        if self.action == "reconcile":
+            await reconcile(self.ctx)
+            return
         await command(self.ctx, self.action)
 
 
@@ -142,7 +175,11 @@ class LabSensor(LabEntity, SensorEntity):
     @property
     def extra_state_attributes(self):
         if self.key == "command":
-            return dict(self.ctx["client"].last_command)
+            client = self.ctx["client"]
+            return {**client.last_command, "csms_available": client.csms_available,
+                    "csms_unavailable_reason": client.csms_unavailable_reason,
+                    "csms_unavailable_since": client.csms_unavailable_since,
+                    "evidence_timeout_s": client.evidence_timeout}
         return {k: v for k, v in station(self.coordinator.data, self._station_id).get("lab_meter", {}).items()
                 if k not in ("power_w", "import_kwh", "export_kwh")}
 
@@ -153,7 +190,8 @@ async def setup_lab(hass, entry, add_entities, platform):
         add_entities([LabButton(ctx, entry, action, name) for action, name in (
             ("start", "Start charging"), ("stop", "Stop transaction"),
             ("apply", "Apply requested power"), ("zero", "Request zero power"),
-            ("clear", "Clear test profile after closure"))])
+            ("clear", "Clear test profile after closure"),
+            ("reconcile", "Reconcile command state"))])
         if not hass.services.has_service(DOMAIN, SERVICE):
             async def submit(call):
                 target = hass.data[DOMAIN].get(call.data["entry_id"])
@@ -167,6 +205,16 @@ async def setup_lab(hass, entry, add_entities, platform):
                 vol.Optional("duration", default=240): vol.All(int, vol.Range(min=1, max=600)),
                 vol.Optional("immediate", default=False): bool,
             }))
+        if not hass.services.has_service(DOMAIN, SERVICE_RECONCILE):
+            async def reconcile_entry(call):
+                target = hass.data[DOMAIN].get(call.data["entry_id"])
+                if not target:
+                    raise HomeAssistantError("Unknown CitrineOS entry")
+                return await reconcile(target)
+            hass.services.async_register(
+                DOMAIN, SERVICE_RECONCILE, reconcile_entry,
+                schema=vol.Schema({vol.Required("entry_id"): str}),
+                supports_response=SupportsResponse.OPTIONAL)
     elif platform == "number":
         add_entities([LabPower(ctx, entry)])
     else:

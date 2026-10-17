@@ -43,8 +43,9 @@ admin privileges.
 
 ## Controls
 
-Five buttons: Start charging, Stop transaction, Apply requested power,
-Request zero power, and Clear test profile after closure. One number stages
+Six buttons: Start charging, Stop transaction, Apply requested power,
+Request zero power, Clear test profile after closure, and Reconcile command
+state (see below). One number stages
 requested signed power from -11,000 W to +11,000 W; changing that number does
 not send a command. Apply sends a finite 180-second absolute TxProfile starting
 five seconds in the future, bound to the freshly observed transaction.
@@ -91,6 +92,63 @@ for a schedule. A schedule always uses profile 9001 at the same stack level, so
 the next schedule replaces whatever a failed one left. HTTP 500 for start or
 stop is still outcome unknown. In Cactus LOA-11 a single CitrineOS 500 during
 a 1 s ramp otherwise blocked every later schedule for almost seven minutes.
+
+### Evidence window
+
+A dispatched command waits at most 90 seconds (`EVIDENCE_TIMEOUT_S`) for
+station evidence. A Start with no observed transaction in that window, and a
+Stop with no observed closure, end as `no_station_evidence` with a logged
+warning and a `detail` reason; a new Start is then allowed. Inside the window
+a second Start is still refused ("Start already dispatched; wait up to N s").
+Profile and clear outcomes are never observed by the integration, so they
+also end as `no_station_evidence` after the window instead of showing
+`dispatched_awaiting_station_evidence` forever. A transaction that appears
+after the window is still recorded as `transaction_observed`.
+
+### Reconcile without a reload
+
+`outcome_unknown` and `dispatch_not_confirmed` are not timed out: they block
+every command except Stop until reconciled. Press **Reconcile command state**
+or call:
+
+```yaml
+action: citrine_ha.lab_reconcile
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+response_variable: reconcile   # optional: the resolved command state
+```
+
+Reconcile refreshes discovery, checks `/health/ready` and the command policy,
+and reads the command station's active transaction from the CSMS. It never
+clears a command sent less than the evidence window ago, because it may still
+land; the call fails with the remaining wait instead. After the window:
+
+| Unresolved command | CSMS shows | Result |
+| --- | --- | --- |
+| Start | an active transaction | `transaction_observed` |
+| Start | no active transaction | `reconciled`, resolution `no_transaction`; Start allowed |
+| Stop | the same transaction still active | `reconciled`, resolution `transaction_still_active` |
+| Stop | no active transaction | `transaction_closure_observed` if the meter record shows closure, else `reconciled` / `no_active_transaction` |
+| Schedule or clear | anything | `reconciled`, resolution `outcome_not_observable` |
+
+The CSMS does not expose a profile or clear outcome to this integration, so
+that resolution says so rather than claiming success. The next schedule uses
+profile 9001 at the same stack level and replaces whatever was applied. A
+command state with nothing unresolved is returned unchanged. The previous
+state, resolution, active transaction and time are kept in the command
+dispatch status attributes and logged once.
+
+### CSMS unavailable
+
+A `/health/ready` that fails with HTTP 5xx, a timeout or a transport error, or
+does not report `pass`, marks the CSMS unavailable (one warning per outage).
+The same check runs before every command is sent. While unavailable, every lab
+command and reconcile fails at once with "CSMS unavailable (...)": nothing is
+sent and the command state does not become `outcome_unknown`. The next passing
+poll re-enables commands (logged once). The command dispatch status sensor
+exposes `csms_available`, `csms_unavailable_reason` and
+`csms_unavailable_since`, so an automation such as the ODE bridge can skip a
+cycle with a condition instead of failing.
 
 Stop uses the exact active transaction. Clear uses only test profile 9001 and
 is blocked while a transaction remains active. Do not clear to stop discharge:

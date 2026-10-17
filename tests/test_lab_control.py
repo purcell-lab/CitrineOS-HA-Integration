@@ -24,8 +24,10 @@ def policy():
 
 
 def client(**kwargs):
-    return ScopedLabClient(MagicMock(), "http://lab.invalid", 1, "reader", True, 3,
-                           command_token="commander", read_only=False, **kwargs)
+    c = ScopedLabClient(MagicMock(), "http://lab.invalid", 1, "reader", True, 3,
+                        command_token="commander", read_only=False, **kwargs)
+    c.ready = AsyncMock()
+    return c
 
 
 def test_bounded_absolute_schedule_and_transaction():
@@ -353,14 +355,14 @@ async def test_ha_controls_do_not_create_legacy_entities_or_automatically_dispat
     entry=MagicMock();entry.entry_id="entry";entry.data={"api_profile":PROFILE_LAB,"read_only":False};entry.options={}
     entities=[]
     await setup_lab(hass,entry,entities.extend,"button")
-    assert len(entities)==5
+    assert len(entities)==6
     assert all(not e.available for e in entities)
     await setup_lab(hass,entry,entities.extend,"number")
     power=entities[-1];power.async_write_ha_state=MagicMock()
     await power.async_set_native_value(-5000)
     assert ctx["lab_requested_w"]==-5000
     await setup_lab(hass,entry,entities.extend,"sensor")
-    assert len(entities)==13
+    assert len(entities)==14
     controller=CitrineLoadController(hass,entry=entry,coordinator=coordinator,client=c)
     await controller.async_start()
     assert controller.state_status=="Manual lab controls"
@@ -491,3 +493,203 @@ for(const [i,p] of JSON.parse(text)) {
               [2,to_ocpp16("profile",profile)],[3,to_ocpp16("clear",{"chargingProfileId":9001})]]
     subprocess.run(["node","--input-type=module","-e",script,policy_file.as_uri()],
                    input=json.dumps(payloads),text=True,check=True,capture_output=True)
+
+
+# purcell-lab/ha-addons#69: lock-outs that needed an integration reload.
+import logging
+from custom_components.citrine_ha.citrine_api import CitrineAuthError, CitrineTransportError
+from custom_components.citrine_ha.lab_control import EVIDENCE_TIMEOUT_S, CitrineUnavailableError
+from custom_components.citrine_ha.lab_entities import reconcile, SERVICE_RECONCILE
+
+
+def aged(c, seconds, key="dispatch_response_at"):
+    c.last_command[key]=(datetime.now(UTC)-timedelta(seconds=seconds)).isoformat()
+
+
+def lab_station(tx=None, **meter):
+    return {"id":STATION,"protocol":PROTOCOL,"isOnline":True,"activeTransactionId":tx,"lab_meter":meter}
+
+
+@pytest.mark.asyncio
+async def test_start_without_station_evidence_times_out_and_allows_new_start(caplog):
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    # Duplicate protection inside the window is kept.
+    c.observe_transaction(lab_station())
+    assert c.last_command["state"]=="dispatched_awaiting_station_evidence"
+    with pytest.raises(CitrineApiError,match="Start already dispatched; wait up to"):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert c._command_client._request.await_count==1
+    aged(c,EVIDENCE_TIMEOUT_S+1)
+    with caplog.at_level(logging.WARNING):
+        c.observe_transaction(lab_station())
+    assert c.last_command["state"]=="no_station_evidence"
+    assert "new Start is allowed" in c.last_command["detail"]
+    assert "No station evidence within 90 s" in caplog.text
+    result=await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert result["state"]=="dispatched_awaiting_station_evidence"
+    assert c._command_client._request.await_count==2
+    # A late transaction is still recorded as evidence.
+    aged(c,EVIDENCE_TIMEOUT_S+1);c.observe_transaction(lab_station())
+    c.observe_transaction(lab_station("tx-late"))
+    assert c.last_command["state"]=="transaction_observed"
+
+
+@pytest.mark.asyncio
+async def test_stale_start_expires_at_dispatch_without_a_poll_and_profiles_end_too():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    aged(c,EVIDENCE_TIMEOUT_S+5)
+    await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert c._command_client._request.await_count==2
+    await _profile(c)
+    aged(c,EVIDENCE_TIMEOUT_S+1)
+    c.observe_transaction(lab_station("t"))
+    # purcell-lab/ha-addons#32: the status no longer stays stale.
+    assert c.last_command["state"]=="no_station_evidence"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_clears_a_command_that_may_still_land():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=CitrineHttpError("gateway",502))
+    with pytest.raises(CitrineApiError):
+        await _profile(c)
+    assert c.last_command["state"]=="outcome_unknown"
+    with pytest.raises(CitrineApiError,match="may still be pending"):
+        await c.reconcile(lab_station("t"))
+    assert c.last_command["state"]=="outcome_unknown"
+    with pytest.raises(CitrineApiError,match="Previous outcome unresolved"):
+        await _profile(c)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resolves_unknown_profile_and_next_profile_goes_out(caplog):
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=[CitrineHttpError("gateway",502),[{"success":True}]])
+    with pytest.raises(CitrineApiError):
+        await _profile(c)
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    with caplog.at_level(logging.WARNING):
+        result=await c.reconcile(lab_station("t"))
+    assert result["state"]=="reconciled" and result["previous_state"]=="outcome_unknown"
+    assert result["resolution"]=="outcome_not_observable"
+    assert "reconciled from outcome_unknown" in caplog.text
+    assert (await _profile(c))["state"]=="dispatched_awaiting_station_evidence"
+    assert c._command_client._request.await_count==2
+
+
+@pytest.mark.asyncio
+async def test_reconcile_start_and_stop_from_csms_transaction_state():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=CitrineHttpError("server",500))
+    with pytest.raises(CitrineApiError):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    assert (await c.reconcile(lab_station("tx-9")))["state"]=="transaction_observed"
+    c.last_command={"action":"start","state":"outcome_unknown","station_id":STATION}
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    result=await c.reconcile(lab_station())
+    assert (result["state"],result["resolution"])==("reconciled","no_transaction")
+    c.last_command={"action":"stop","state":"outcome_unknown","transaction_id":"tx-9"}
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    assert (await c.reconcile(lab_station("tx-9")))["resolution"]=="transaction_still_active"
+    # Nothing to resolve is reported, not invented.
+    c.last_command={"action":"profile","state":"rejected","http_status":409}
+    assert (await c.reconcile(lab_station("tx-9")))["state"]=="rejected"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_needs_a_reachable_csms():
+    c=client();c.control_policy=AsyncMock(side_effect=CitrineHttpError("gateway",502))
+    c.last_command={"action":"profile","state":"outcome_unknown","transaction_id":"t"}
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    with pytest.raises(CitrineUnavailableError):
+        await c.reconcile(lab_station("t"))
+    assert c.last_command["state"]=="outcome_unknown" and c.csms_available is False
+    c.control_policy=AsyncMock(return_value=policy())
+    with pytest.raises(CitrineUnavailableError):
+        await c.reconcile(lab_station("t"))
+    c.control_policy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_health_failure_marks_csms_unavailable_once_and_commands_fail_fast(caplog):
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    c.ready=AsyncMock(side_effect=CitrineHttpError("Citrine API GET /health/ready failed (502)",502))
+    with caplog.at_level(logging.INFO):
+        for _ in range(3):
+            with pytest.raises(CitrineUnavailableError,match="CSMS unavailable"):
+                await c.ping()
+    assert caplog.text.count("CSMS unavailable")==1
+    assert c.csms_available is False and "502" in c.csms_unavailable_reason
+    with pytest.raises(CitrineUnavailableError,match="CSMS unavailable"):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    c._command_client._request.assert_not_called()
+    assert c.last_command=={"state":"not_sent"}
+    # Recovery is automatic on the next passing poll.
+    c.ready=AsyncMock();c._request=AsyncMock(side_effect=[CitrineAuthError("denied"),[]])
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await c.ping()
+    assert c.csms_available is True and "available again" in caplog.text
+    assert (await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION))["state"]=="dispatched_awaiting_station_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error",[CitrineTransportError("Citrine API transport error"),
+                                  CitrineHttpError("Citrine API GET /health/ready failed (503)",503)])
+async def test_readiness_failure_at_dispatch_is_not_an_unknown_outcome(error):
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    c.ready=AsyncMock(side_effect=error)
+    with pytest.raises(CitrineUnavailableError):
+        await _profile(c)
+    c._command_client._request.assert_not_called()
+    assert c.last_command=={"state":"not_sent"} and c.csms_available is False
+
+
+@pytest.mark.asyncio
+async def test_auth_and_policy_errors_do_not_mark_csms_unavailable():
+    c=client();c.ready=AsyncMock(side_effect=CitrineAuthError("denied"))
+    with pytest.raises(CitrineAuthError):
+        await c.ping()
+    assert c.csms_available is True
+
+
+def lab_ctx(c,data,ok=True):
+    coordinator=MagicMock();coordinator.async_request_refresh=AsyncMock();coordinator.async_refresh=AsyncMock()
+    coordinator.data=data;coordinator.last_update_success=ok
+    return {"client":c,"coordinator":coordinator}
+
+
+@pytest.mark.asyncio
+async def test_ha_command_reports_csms_unavailable_and_reconcile_service():
+    from homeassistant.core import SupportsResponse
+    from homeassistant.exceptions import HomeAssistantError
+    c=client();c.csms_available=False;c.csms_unavailable_reason="GET /health/ready failed (502)"
+    c.request_start_transaction=AsyncMock()
+    ctx=lab_ctx(c,{"stations":[lab_station()]},ok=False)
+    with pytest.raises(HomeAssistantError,match="CSMS unavailable"):
+        await command(ctx,"start")
+    c.request_start_transaction.assert_not_called()
+    with pytest.raises(HomeAssistantError,match="CSMS unavailable"):
+        await reconcile(ctx)
+    c.csms_available=True;c.control_policy=AsyncMock(return_value=policy())
+    c.last_command={"action":"profile","state":"outcome_unknown","transaction_id":"t"}
+    aged(c,EVIDENCE_TIMEOUT_S+1,"dispatched_at")
+    ctx=lab_ctx(c,{"stations":[lab_station("t")]})
+    assert (await reconcile(ctx))["state"]=="reconciled"
+    ctx["coordinator"].async_refresh.assert_awaited_once()
+    hass=MagicMock();hass.data={"citrine_ha":{"entry":ctx}};hass.services.has_service.return_value=False
+    entry=MagicMock();entry.entry_id="entry"
+    buttons=[]
+    await setup_lab(hass,entry,buttons.extend,"button")
+    assert buttons[-1].action=="reconcile"
+    calls={call.args[1]:call for call in hass.services.async_register.call_args_list}
+    assert calls[SERVICE_RECONCILE].kwargs["supports_response"]==SupportsResponse.OPTIONAL
+    handler=calls[SERVICE_RECONCILE].args[2]
+    assert (await handler(MagicMock(data={"entry_id":"entry"})))["state"]=="reconciled"

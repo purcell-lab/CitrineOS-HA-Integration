@@ -91,6 +91,10 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             return await self._fetch_discovery(tenant_id)
         except (CitrineApiError, HasuraError, ValueError) as err:
+            # A lab dispatch still ends after its evidence window while polls fail.
+            expire = getattr(self._citrine_client, "expire_awaiting", None)
+            if callable(expire):
+                expire()
             # HA retains last data but marks entities unavailable. Never report
             # cached or empty discovery as a successful refresh after failure.
             raise UpdateFailed(str(err)) from err

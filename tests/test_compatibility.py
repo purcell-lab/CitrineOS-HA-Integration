@@ -305,3 +305,19 @@ async def test_telemetry_cannot_revalidate_failed_discovery(tmp_path):
         await coord.async_refresh_intake_telemetry()
     with pytest.raises(UpdateFailed):
         coord.clear_intake_telemetry_error()
+
+
+@pytest.mark.asyncio
+async def test_transport_and_not_ready_errors_are_distinct_api_errors():
+    import aiohttp
+    from custom_components.citrine_ha.citrine_api import CitrineNotReadyError, CitrineTransportError
+    session = MagicMock()
+    session.request.side_effect = aiohttp.ClientConnectionError("refused")
+    c = client(session, api_profile=PROFILE_V2)
+    with pytest.raises(CitrineTransportError, match="transport error"):
+        await c._request("GET", "/health/ready")
+    c._request = AsyncMock(return_value={"status": "fail"})
+    with pytest.raises(CitrineNotReadyError):
+        await c.ready()
+    # Still the compatibility error callers already handle.
+    assert issubclass(CitrineNotReadyError, CitrineCompatibilityError)
