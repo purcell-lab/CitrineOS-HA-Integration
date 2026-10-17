@@ -9,7 +9,7 @@ import pytest
 
 from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineHttpError, CitrineReadOnlyError
 from custom_components.citrine_ha.compatibility import PROFILE_LAB, automatic_control_disabled
-from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period
+from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period, paths_for, transaction
 from custom_components.citrine_ha.lab_telemetry import parse_meter
 from custom_components.citrine_ha.lab_entities import setup_lab, command
 from custom_components.citrine_ha.config_flow import CitrineOptionsFlow
@@ -203,6 +203,66 @@ async def test_start_500_still_locks_but_start_409_is_rejected():
     assert c.last_command["state"]=="rejected"
     result=await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
     assert result["state"]=="dispatched_awaiting_station_evidence"
+
+
+def real_policy(**kw):
+    return {**policy(), "station_id": "ACME-WB-0042", "real_devices_enabled": True,
+            "protocols": ["ocpp2.1", "ocpp2.0.1"],
+            "commands_by_protocol": {x: list(paths_for(x).values()) for x in ("ocpp2.1", "ocpp2.0.1")}, **kw}
+
+
+@pytest.mark.asyncio
+async def test_physical_station_only_when_server_allows_real_devices():
+    c=client();c._command_client._request=AsyncMock(return_value=real_policy())
+    await c.control_policy()
+    assert c.station=="ACME-WB-0042" and c.real_devices is True
+    assert c.protocols==("ocpp2.1","ocpp2.0.1")
+    for bad in [real_policy(real_devices_enabled=False), real_policy(station_id="a/b"),
+                real_policy(real_devices_enabled="yes"), real_policy(protocols=["ocpp2.0.1"]),
+                real_policy(protocols=["ocpp2.1","ocpp1.6"]),
+                real_policy(commands_by_protocol={"ocpp2.1": list(PATHS.values())})]:
+        c=client();c._command_client._request=AsyncMock(return_value=bad)
+        with pytest.raises(CitrineCompatibilityError):
+            await c.control_policy()
+
+
+@pytest.mark.asyncio
+async def test_older_server_policy_means_ocpp_2_1_only():
+    c=client();c._command_client._request=AsyncMock(return_value=policy())
+    await c.control_policy()
+    assert c.protocols==("ocpp2.1",) and c.real_devices is False
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    c.control_policy=AsyncMock(return_value=policy())
+    with pytest.raises(CitrineCompatibilityError):
+        await c.submit_schedule(protocol="ocpp2.0.1", station_id=STATION, transaction_id="t",
+                                periods=[charge_period(0, 7000, 3)], immediate=True)
+    assert c._command_client._request.await_count==0
+
+
+@pytest.mark.asyncio
+async def test_ocpp_2_0_1_station_uses_2_0_1_routes_and_charging_only_periods():
+    c=client();c._command_client._request=AsyncMock(return_value=real_policy())
+    await c.control_policy()
+    c.control_policy=AsyncMock(return_value=real_policy())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    await c.submit_schedule(protocol="ocpp2.0.1", station_id="ACME-WB-0042", transaction_id="TX:42.a",
+                            periods=[charge_period(0, 7000, 1)], immediate=True)
+    call=c._command_client._request.call_args
+    assert call.args[:2]==("POST","/ocpp/2.0.1/smartcharging/setChargingProfile")
+    assert call.kwargs["params"]=={"identifier":"ACME-WB-0042","tenantId":1}
+    with pytest.raises(CitrineCompatibilityError):
+        await c.submit_schedule(protocol="ocpp2.0.1", station_id="ACME-WB-0042", transaction_id="TX:42.a",
+                                periods=[power_period(0, 5000)], immediate=True)
+    assert c._command_client._request.await_count==1
+
+
+def test_paths_and_transaction_ids_for_physical_chargers():
+    assert paths_for("ocpp2.0.1")["stop"]=="/ocpp/2.0.1/evdriver/requestStopTransaction"
+    assert paths_for("ocpp2.1")==PATHS
+    for ok in ["a1:b2.c3","TX@1|2+3=4","*abc*","uuid-0-1"]:
+        assert transaction(ok)
+    for bad in ["a b","a/b","x"*65,"é",""]:
+        assert not transaction(bad)
 
 
 def test_power_period_keeps_11_kw_bounds_unless_setpoint_exceeds():
