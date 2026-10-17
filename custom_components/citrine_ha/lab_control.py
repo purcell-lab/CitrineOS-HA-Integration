@@ -214,7 +214,15 @@ class ScopedLabClient(CitrineClient):
             try:
                 response = await self._command_client._request(
                     "POST", PATHS[action], params={"identifier": self.station, "tenantId": 1}, json=payload)
-            except CitrineApiError:
+            except CitrineApiError as err:
+                status = getattr(err, "status", None)
+                # A 4xx is refused before dispatch. A 500 on a profile is safe to follow with the
+                # next profile: it has the same id and stack level, so it replaces whatever was
+                # applied. Timeouts, transport errors and 502-504 may follow dispatch.
+                if status is not None and (400 <= status < 500 or (status == 500 and action == "profile")):
+                    self.last_command.update(state="rejected", http_status=status,
+                                             detail="Server refused the command; no automatic retry.")
+                    raise
                 self.last_command.update(state="outcome_unknown",
                                          detail="Reconcile the station before another command; no automatic retry.")
                 raise

@@ -33,6 +33,14 @@ class CitrineReadOnlyError(CitrineApiError):
     """Control is disabled for this entry."""
 
 
+class CitrineHttpError(CitrineApiError):
+    """The server answered with an HTTP error status."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class CitrineClient:
     """CitrineOS API client."""
 
@@ -889,8 +897,8 @@ class CitrineClient:
 
                 text = await resp.text()
                 if resp.status >= 400:
-                    raise CitrineApiError(
-                        f"Citrine API {method} {path} failed ({resp.status})"
+                    raise CitrineHttpError(
+                        f"Citrine API {method} {path} failed ({resp.status})", resp.status
                     )
                 if 300 <= resp.status < 400:
                     raise CitrineApiError("Citrine API redirect refused")

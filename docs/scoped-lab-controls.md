@@ -59,9 +59,17 @@ Use these scoped controls, not inherited legacy convenience services.
 A successful HTTP/native API result is labelled
 `dispatched_awaiting_station_evidence`, not Accepted or Charging. Actual station
 CALLRESULT and metered behaviour are separate acceptance evidence. A transport
-failure is outcome unknown, with no automatic resend. A subsequent non-stop
-command is blocked until the unresolved outcome is investigated; resetting the
-integration is not proof the original command failed.
+failure, a timeout or a gateway error (HTTP 502 to 504) is outcome unknown,
+with no automatic resend. A subsequent non-stop command is blocked until the
+unresolved outcome is investigated; resetting the integration is not proof the
+original command failed.
+
+A definite error reply is `rejected` and does not block the next command: any
+4xx (the lab gateway and CitrineOS refuse these before dispatch), and HTTP 500
+for a schedule. A schedule always uses profile 9001 at the same stack level, so
+the next schedule replaces whatever a failed one left. HTTP 500 for start or
+stop is still outcome unknown. In Cactus LOA-11 a single CitrineOS 500 during
+a 1 s ramp otherwise blocked every later schedule for almost seven minutes.
 
 Stop uses the exact active transaction. Clear uses only test profile 9001 and
 is blocked while a transaction remains active. Do not clear to stop discharge:
