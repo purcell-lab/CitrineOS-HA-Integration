@@ -7,7 +7,7 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
-from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineReadOnlyError
+from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineHttpError, CitrineReadOnlyError
 from custom_components.citrine_ha.compatibility import PROFILE_LAB, automatic_control_disabled
 from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period
 from custom_components.citrine_ha.lab_telemetry import parse_meter
@@ -154,6 +154,55 @@ async def test_ambiguous_dispatch_response_is_not_success(response):
     with pytest.raises(CitrineApiError):
         await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
     assert c.last_command["state"]=="dispatch_not_confirmed"
+
+
+async def _profile(c):
+    return await c.submit_schedule(protocol=PROTOCOL, station_id=STATION, transaction_id="t",
+                                   periods=[charge_period(0, 7000, 3)], immediate=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409, 500])
+async def test_profile_error_reply_is_rejected_and_next_profile_goes_out(status):
+    # LOA-11 (17 Oct 2026): a CitrineOS 500 during a 1 s ramp locked every later profile.
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=[CitrineHttpError("refused", status), [{"success":True}]])
+    with pytest.raises(CitrineApiError):
+        await _profile(c)
+    assert c.last_command["state"]=="rejected" and c.last_command["http_status"]==status
+    result=await _profile(c)
+    assert result["state"]=="dispatched_awaiting_station_evidence"
+    assert c._command_client._request.await_count==2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [CitrineHttpError("gateway", 502), CitrineHttpError("gateway", 504),
+                                   CitrineApiError("Citrine API timeout calling /x")])
+async def test_profile_outcome_unknown_still_locks(error):
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=error)
+    with pytest.raises(CitrineApiError):
+        await _profile(c)
+    assert c.last_command["state"]=="outcome_unknown"
+    with pytest.raises(CitrineApiError, match="Previous outcome unresolved"):
+        await _profile(c)
+    assert c._command_client._request.await_count==1
+
+
+@pytest.mark.asyncio
+async def test_start_500_still_locks_but_start_409_is_rejected():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=CitrineHttpError("server", 500))
+    with pytest.raises(CitrineApiError):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert c.last_command["state"]=="outcome_unknown"
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    c._command_client._request=AsyncMock(side_effect=[CitrineHttpError("conflict", 409), [{"success":True}]])
+    with pytest.raises(CitrineApiError):
+        await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert c.last_command["state"]=="rejected"
+    result=await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
+    assert result["state"]=="dispatched_awaiting_station_evidence"
 
 
 def test_power_period_keeps_11_kw_bounds_unless_setpoint_exceeds():
