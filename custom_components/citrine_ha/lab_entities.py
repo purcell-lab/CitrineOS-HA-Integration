@@ -8,7 +8,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .citrine_api import CitrineApiError
-from .lab_control import PROTOCOL, PROFILE_ID, ScopedLabClient, power_period, number
+from .lab_control import (PROTOCOL, PROFILE_ID, MAX_EXPORT_W, MAX_IMPORT_W, ScopedLabClient,
+                          power_period, number)
 
 SERVICE = "lab_schedule"
 
@@ -95,8 +96,8 @@ class LabButton(LabEntity, ButtonEntity):
 
 
 class LabPower(LabEntity, NumberEntity):
-    _attr_native_min_value = -11000
-    _attr_native_max_value = 11000
+    _attr_native_min_value = -MAX_EXPORT_W
+    _attr_native_max_value = MAX_IMPORT_W
     _attr_native_step = 100
     _attr_native_unit_of_measurement = "W"
     _attr_mode = "box"
@@ -109,8 +110,8 @@ class LabPower(LabEntity, NumberEntity):
         return self.ctx.get("lab_requested_w", 0)
 
     async def async_set_native_value(self, value):
-        if not number(value, -11000, 11000):
-            raise HomeAssistantError("Requested power must be within ±11,000 W")
+        if not number(value, -MAX_EXPORT_W, MAX_IMPORT_W):
+            raise HomeAssistantError(f"Requested power must be within ±{MAX_IMPORT_W:,} W")
         self.ctx["lab_requested_w"] = value
         self.async_write_ha_state()
 
