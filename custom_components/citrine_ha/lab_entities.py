@@ -17,7 +17,7 @@ def station(data, station_id):
     return next((s for s in (data or {}).get("stations", []) if s.get("id") == station_id), {})
 
 
-async def command(ctx, action, *, periods=None, duration=180):
+async def command(ctx, action, *, periods=None, duration=180, immediate=False):
     c = ctx["coordinator"]
     client = ctx["client"]
     if not isinstance(client, ScopedLabClient) or client.read_only:
@@ -48,7 +48,7 @@ async def command(ctx, action, *, periods=None, duration=180):
             await client.submit_schedule(
                 protocol=PROTOCOL, station_id=sid, transaction_id=tx,
                 periods=periods if periods is not None else [power_period(0, watts)],
-                duration=duration)
+                duration=duration, immediate=immediate)
     except CitrineApiError as err:
         raise HomeAssistantError(str(err)) from err
     finally:
@@ -154,11 +154,13 @@ async def setup_lab(hass, entry, add_entities, platform):
                 target = hass.data[DOMAIN].get(call.data["entry_id"])
                 if not target:
                     raise HomeAssistantError("Unknown CitrineOS entry")
-                await command(target, "schedule", periods=call.data["periods"], duration=call.data["duration"])
+                await command(target, "schedule", periods=call.data["periods"], duration=call.data["duration"],
+                              immediate=call.data["immediate"])
             hass.services.async_register(DOMAIN, SERVICE, submit, schema=vol.Schema({
                 vol.Required("entry_id"): str,
                 vol.Required("periods"): [dict],
                 vol.Optional("duration", default=240): vol.All(int, vol.Range(min=1, max=600)),
+                vol.Optional("immediate", default=False): bool,
             }))
     elif platform == "number":
         add_entities([LabPower(ctx, entry)])

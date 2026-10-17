@@ -40,31 +40,55 @@ def transaction(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
 
 
+def valid_period(p):
+    """A V2G CentralSetpoint period, or an AC charging-only limit period.
+
+    Mirrors the lab server policy: charging-only periods carry a limit and
+    optionally numberPhases 1 or 3, with phaseToUse (1-3) only for one phase.
+    """
+    if not isinstance(p, dict) or not number(p.get("limit"), 0, 11000):
+        return False
+    if p.get("operationMode") == "CentralSetpoint":
+        return (not set(p) - {"startPeriod", "limit", "dischargeLimit", "setpoint", "operationMode"}
+                and number(p.get("dischargeLimit"), -11000, 0)
+                and number(p.get("setpoint"), p["dischargeLimit"], p["limit"]))
+    if set(p) - {"startPeriod", "limit", "numberPhases", "phaseToUse"}:
+        return False
+    phases = p.get("numberPhases")
+    if phases is not None and phases not in (1, 3):
+        return False
+    return "phaseToUse" not in p or (phases == 1 and integer(p["phaseToUse"], 1, 3))
+
+
 def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_ID,
-                  stack_level=1, start_at=None):
-    """Produce one bounded absolute TxProfile, never a default/station profile."""
+                  stack_level=1, start_at=None, immediate=False):
+    """Produce one bounded absolute TxProfile, never a default/station profile.
+
+    immediate starts the schedule one second ago, so a replacement profile
+    leaves no unlimited gap before its first period.
+    """
     if (not transaction(transaction_id) or not integer(duration, 1, 600)
             or not integer(profile_id, 1, 2147483647) or not integer(stack_level, 0, 10)
-            or not isinstance(periods, list) or not 1 <= len(periods) <= 10):
+            or not isinstance(periods, list) or not 1 <= len(periods) <= 10
+            or not isinstance(immediate, bool) or (immediate and start_at is not None)):
         raise CitrineCompatibilityError("Invalid bounded lab schedule")
     now = datetime.now(UTC)
-    if start_at is None:
+    if immediate:
+        start_at = now - timedelta(seconds=1)
+    elif start_at is None:
         start_at = now + timedelta(seconds=5)
     if not isinstance(start_at, datetime) or start_at.tzinfo is None:
         raise CitrineCompatibilityError("An explicit timezone is required")
-    if not 1 <= (start_at - now).total_seconds() <= 120:
+    if not immediate and not 1 <= (start_at - now).total_seconds() <= 120:
         raise CitrineCompatibilityError("Schedule must start 1 to 120 seconds in the future")
     last = -1
     normalized = []
     for index, p in enumerate(periods):
-        if (not isinstance(p, dict) or set(p) - {"startPeriod", "limit", "dischargeLimit", "setpoint", "operationMode"}
+        if (not valid_period(p)
                 or not integer(p.get("startPeriod"), 0, duration - 1)
-                or (index == 0 and p["startPeriod"] != 0) or p["startPeriod"] <= last
-                or not number(p.get("limit"), 0, 11000)
-                or not number(p.get("dischargeLimit"), -11000, 0)
-                or not number(p.get("setpoint"), p["dischargeLimit"], p["limit"])
-                or p.get("operationMode") != "CentralSetpoint"):
-            raise CitrineCompatibilityError("Invalid lab period: signed W bounds and CentralSetpoint required")
+                or (index == 0 and p["startPeriod"] != 0) or p["startPeriod"] <= last):
+            raise CitrineCompatibilityError(
+                "Invalid lab period: W bounds, and CentralSetpoint or a charging-only limit")
         last = p["startPeriod"]
         normalized.append(dict(p))
     return {"evseId": 1, "chargingProfile": {
@@ -75,6 +99,14 @@ def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_I
                               "duration": duration, "chargingRateUnit": "W",
                               "chargingSchedulePeriod": normalized}],
     }}
+
+
+def charge_period(offset, watts, number_phases=None):
+    """An AC charging-only limit period."""
+    p = {"startPeriod": offset, "limit": watts}
+    if number_phases is not None:
+        p["numberPhases"] = number_phases
+    return p
 
 
 def power_period(offset, watts):
@@ -205,9 +237,10 @@ class ScopedLabClient(CitrineClient):
                                     protocol=protocol, station_id=station_id)
 
     async def submit_schedule(self, *, protocol, station_id, transaction_id, periods,
-                              duration=240, profile_id=PROFILE_ID, stack_level=1, start_at=None):
+                              duration=240, profile_id=PROFILE_ID, stack_level=1, start_at=None,
+                              immediate=False):
         payload = build_profile(transaction_id, periods, duration=duration, profile_id=profile_id,
-                                stack_level=stack_level, start_at=start_at)
+                                stack_level=stack_level, start_at=start_at, immediate=immediate)
         return await self._dispatch("profile", payload, protocol=protocol, station_id=station_id)
 
     async def set_charging_profile(self, *, protocol, station_id, limit, setpoint=None,
