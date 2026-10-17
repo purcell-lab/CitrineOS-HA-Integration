@@ -33,6 +33,14 @@ class CitrineReadOnlyError(CitrineApiError):
     """Control is disabled for this entry."""
 
 
+class CitrineNotReadyError(CitrineCompatibilityError):
+    """/health/ready answered but did not report pass."""
+
+
+class CitrineTransportError(CitrineApiError):
+    """No HTTP answer: timeout, connection or transport failure."""
+
+
 class CitrineHttpError(CitrineApiError):
     """The server answered with an HTTP error status."""
 
@@ -86,9 +94,7 @@ class CitrineClient:
         if self.api_profile == PROFILE_LEGACY:
             await self._request("GET", "/data/ocpprouter/systemConfig")
             return
-        health = await self._request("GET", "/health/ready")
-        if not isinstance(health, dict) or health.get("status") != "pass":
-            raise CitrineCompatibilityError("CitrineOS is not ready")
+        await self.ready()
         if not self._auth_token:
             raise CitrineAuthError("The 2.x profile requires an API bearer token")
         # A public health endpoint does not establish authentication. Verify a
@@ -103,6 +109,12 @@ class CitrineClient:
         rows = await self._request("GET", "/commands/tariff", params=params)
         if not isinstance(rows, list):
             raise CitrineCompatibilityError("Unexpected protected-read response")
+
+    async def ready(self) -> None:
+        """GET /health/ready (public) and require status pass."""
+        health = await self._request("GET", "/health/ready")
+        if not isinstance(health, dict) or health.get("status") != "pass":
+            raise CitrineNotReadyError("CitrineOS is not ready")
 
     async def get_charging_stations(self) -> list[dict[str, Any]]:
         """Fetch charging stations directly from CitrineOS REST data endpoints."""
@@ -912,9 +924,9 @@ class CitrineClient:
 
                 return text
         except asyncio.TimeoutError as err:
-            raise CitrineApiError(f"Citrine API timeout calling {path}") from err
+            raise CitrineTransportError(f"Citrine API timeout calling {path}") from err
         except aiohttp.ClientError as err:
-            raise CitrineApiError("Citrine API transport error") from err
+            raise CitrineTransportError("Citrine API transport error") from err
         except ValueError as err:
             raise CitrineApiError("Invalid Citrine API JSON response") from err
 
