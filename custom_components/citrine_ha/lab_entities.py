@@ -1,4 +1,4 @@
-"""Small, explicit manual control surface for the single enrolled simulator."""
+"""Small, explicit manual control surface for the single enrolled command station."""
 import voluptuous as vol
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity
@@ -8,7 +8,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .citrine_api import CitrineApiError
-from .lab_control import (PROTOCOL, PROFILE_ID, MAX_EXPORT_W, MAX_IMPORT_W, ScopedLabClient,
+from .lab_control import (PROFILE_ID, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient,
                           power_period, number)
 
 SERVICE = "lab_schedule"
@@ -26,28 +26,30 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False):
     await c.async_request_refresh()
     sid = client.station
     s = station(c.data, sid)
-    if not c.last_update_success or not s.get("isOnline") or s.get("protocol") != PROTOCOL:
-        raise HomeAssistantError("Fresh online OCPP 2.1 simulator evidence is required")
+    protocol = s.get("protocol")
+    if not c.last_update_success or not s.get("isOnline") or protocol not in client.protocols:
+        raise HomeAssistantError(
+            f"Fresh online evidence on {' or '.join(client.protocols)} is required for {sid}")
     tx = s.get("activeTransactionId")
     try:
         if action == "start":
             if tx:
                 raise HomeAssistantError("The simulator already has an active transaction")
-            await client.request_start_transaction(protocol=PROTOCOL, station_id=sid)
+            await client.request_start_transaction(protocol=protocol, station_id=sid)
         elif action == "stop":
             if not tx:
                 raise HomeAssistantError("No active transaction to stop")
-            await client.request_stop_transaction(protocol=PROTOCOL, station_id=sid, transaction_id=tx)
+            await client.request_stop_transaction(protocol=protocol, station_id=sid, transaction_id=tx)
         elif action == "clear":
             if tx:
                 raise HomeAssistantError("Stop and verify transaction closure before profile cleanup")
-            await client.clear_charging_profile(protocol=PROTOCOL, station_id=sid, profile_id=PROFILE_ID)
+            await client.clear_charging_profile(protocol=protocol, station_id=sid, profile_id=PROFILE_ID)
         else:
             if not tx:
                 raise HomeAssistantError("A current transaction is required")
             watts = 0 if action == "zero" else ctx.get("lab_requested_w", 0)
             await client.submit_schedule(
-                protocol=PROTOCOL, station_id=sid, transaction_id=tx,
+                protocol=protocol, station_id=sid, transaction_id=tx,
                 periods=periods if periods is not None else [power_period(0, watts)],
                 duration=duration, immediate=immediate)
     except CitrineApiError as err:
@@ -66,17 +68,19 @@ class LabEntity(CoordinatorEntity):
         self._station_id = sid
         self._attr_unique_id = f"{entry.entry_id}_{sid}_lab_{key}"
         self._attr_name = name
+        simulator = STATION_PATTERN.fullmatch(sid) is not None
         self._attr_device_info = {
             "identifiers": {(DOMAIN, f"1:{sid}")},
-            "name": f"CitrineOS EVerest V2G lab {sid}",
-            "manufacturer": "EVerest",
-            "model": "Isolated simulator",
+            "name": f"CitrineOS EVerest V2G lab {sid}" if simulator else f"CitrineOS lab {sid}",
+            "model": "Isolated simulator" if simulator else "Physical charger (lab command station)",
+            **({"manufacturer": "EVerest"} if simulator else {}),
         }
 
     @property
     def available(self):
         s = station(self.coordinator.data, self._station_id)
-        return super().available and bool(s.get("isOnline")) and s.get("protocol") == PROTOCOL
+        return (super().available and bool(s.get("isOnline"))
+                and s.get("protocol") in self.ctx["client"].protocols)
 
 
 class LabButton(LabEntity, ButtonEntity):

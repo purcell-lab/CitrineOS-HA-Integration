@@ -8,11 +8,32 @@ never start in this mode.
 ## Prerequisites
 
 - CitrineOS isolated App with the matching scoped gateway policy.
-- Explicit enrolment of `SIM-EV-EVEREST-V2G-01` on tenant 1.
-- Observed `ocpp2.1`; no mutation fallback to 2.0.1.
+- Explicit enrolment of the gateway's single command station on tenant 1
+  (a `SIM-EV-EVEREST-*` simulator by default).
+- Observed `ocpp2.1`, `ocpp2.0.1` or `ocpp1.6`, as listed in the gateway
+  policy's `protocols`. Commands use the protocol the station actually
+  connected with; there is no fallback between versions.
 - Separate reader and command credentials, entered only in HA's protected configuration.
 - Confirmed migration, simulator readiness and an agreed bounded test.
-- Physical chargers and BSV are excluded.
+- BSV is excluded.
+
+### Physical command station
+
+A physical (third-party) charger can be the command station only when the
+CitrineOS App sets `command_real_stations_enabled: true` and that station
+connects through the plugfest listener. The gateway policy then reports
+`real_devices_enabled: true`; the integration accepts a non-`SIM-` station ID
+only in that case and labels the device "Physical charger (lab command
+station)". On `ocpp2.0.1` and `ocpp1.6` stations schedules are charging-only:
+`operationMode`, `setpoint` and `dischargeLimit` are rejected before anything
+is sent, and the bidirectional capability is not offered.
+
+On `ocpp1.6` the integration sends the 1.6 messages (citrineos_server 0.6.0):
+RemoteStartTransaction on connector 1, RemoteStopTransaction and a
+`csChargingProfiles` TxProfile with the integer transaction ID, and
+ClearChargingProfile by `id`. Limits are rounded to whole watts and
+`phaseToUse` is rejected (1.6 has none). Chargers that accept only amp
+schedules reject the W profile, and the command state shows that.
 
 Select the profile in Configure/options, provide its command credential, and
 explicitly turn read-only off. Connection validation checks readiness, protected

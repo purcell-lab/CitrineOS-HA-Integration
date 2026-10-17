@@ -116,15 +116,17 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # stations read-only, even in an entry with scoped lab controls.
             from .lab_control import PROTOCOL
             lab_station = getattr(self._citrine_client, "station", None)
+            lab_protocols = getattr(self._citrine_client, "protocols", (PROTOCOL,))
             for station in merged:
                 allowed = (self._entry_data.get(CONF_API_PROFILE) == PROFILE_LAB
                            and not self._citrine_client.read_only
-                           and station["id"] == lab_station and station.get("protocol") == PROTOCOL)
+                           and station["id"] == lab_station and station.get("protocol") in lab_protocols)
                 self._capability_cache[station["id"]] = {
                     "supports_remote_start": allowed, "supports_remote_stop": allowed,
                     "supports_set_charging_profile": allowed,
                     "supports_clear_charging_profile": allowed,
-                    "supports_bidirectional_power_transfer": allowed,
+                    # OCPP 2.0.1 and 1.6 profiles carry no setpoint or discharge limit.
+                    "supports_bidirectional_power_transfer": allowed and station.get("protocol") == PROTOCOL,
                     "supports_ems_profile_control": False,
                     "ems_profile_support_reason": "Automatic site controller disabled",
                     "capability_evidence": "scoped_lab_policy" if allowed else "not_verified",
