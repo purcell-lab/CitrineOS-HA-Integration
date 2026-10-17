@@ -125,7 +125,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "supports_remote_start": allowed, "supports_remote_stop": allowed,
                     "supports_set_charging_profile": allowed,
                     "supports_clear_charging_profile": allowed,
-                    # OCPP 2.0.1 profiles carry no setpoint or discharge limit.
+                    # OCPP 2.0.1 and 1.6 profiles carry no setpoint or discharge limit.
                     "supports_bidirectional_power_transfer": allowed and station.get("protocol") == PROTOCOL,
                     "supports_ems_profile_control": False,
                     "ems_profile_support_reason": "Automatic site controller disabled",

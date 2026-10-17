@@ -9,7 +9,7 @@ import pytest
 
 from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineHttpError, CitrineReadOnlyError
 from custom_components.citrine_ha.compatibility import PROFILE_LAB, automatic_control_disabled
-from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period, paths_for, transaction
+from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period, paths_for, transaction, to_ocpp16
 from custom_components.citrine_ha.lab_telemetry import parse_meter
 from custom_components.citrine_ha.lab_entities import setup_lab, command
 from custom_components.citrine_ha.config_flow import CitrineOptionsFlow
@@ -219,7 +219,7 @@ async def test_physical_station_only_when_server_allows_real_devices():
     assert c.protocols==("ocpp2.1","ocpp2.0.1")
     for bad in [real_policy(real_devices_enabled=False), real_policy(station_id="a/b"),
                 real_policy(real_devices_enabled="yes"), real_policy(protocols=["ocpp2.0.1"]),
-                real_policy(protocols=["ocpp2.1","ocpp1.6"]),
+                real_policy(protocols=["ocpp2.1","ocpp1.5"]),
                 real_policy(commands_by_protocol={"ocpp2.1": list(PATHS.values())})]:
         c=client();c._command_client._request=AsyncMock(return_value=bad)
         with pytest.raises(CitrineCompatibilityError):
@@ -428,3 +428,66 @@ async def test_policy_station_outside_simulator_namespace_rejected(station_id):
     with pytest.raises(CitrineCompatibilityError):
         await c.control_policy()
     assert c.station == STATION
+
+
+def policy_16(**kw):
+    protocols = ["ocpp2.1", "ocpp2.0.1", "ocpp1.6"]
+    return real_policy(protocols=protocols,
+                       commands_by_protocol={x: list(paths_for(x).values()) for x in protocols}, **kw)
+
+
+@pytest.mark.asyncio
+async def test_ocpp_1_6_station_gets_1_6_messages():
+    c=client();c._command_client._request=AsyncMock(return_value=policy_16())
+    await c.control_policy()
+    assert c.protocols==("ocpp2.1","ocpp2.0.1","ocpp1.6")
+    c.control_policy=AsyncMock(return_value=policy_16())
+    c._command_client._request=AsyncMock(return_value=[{"success":True}])
+    sid="ACME-WB-0042"
+    await c.request_start_transaction(protocol="ocpp1.6", station_id=sid)
+    call=c._command_client._request.call_args
+    assert call.args[1]=="/ocpp/1.6/evdriver/remoteStartTransaction"
+    assert call.kwargs["json"]=={"connectorId":1,"idTag":"C17E0001"}
+    c.last_command={"state":"transaction_observed"}
+    await c.submit_schedule(protocol="ocpp1.6", station_id=sid, transaction_id="42",
+                            periods=[charge_period(0, 7200.4, 3), charge_period(60, 0, 3)], immediate=True)
+    call=c._command_client._request.call_args
+    assert call.args[1]=="/ocpp/1.6/smartcharging/setChargingProfile"
+    body=call.kwargs["json"];cp=body["csChargingProfiles"]
+    assert body["connectorId"]==1 and cp["transactionId"]==42 and cp["chargingProfileId"]==9001
+    assert cp["chargingProfilePurpose"]=="TxProfile" and cp["chargingProfileKind"]=="Absolute"
+    assert cp["chargingSchedule"]["chargingRateUnit"]=="W"
+    assert cp["chargingSchedule"]["chargingSchedulePeriod"]==[
+        {"startPeriod":0,"limit":7200,"numberPhases":3},{"startPeriod":60,"limit":0,"numberPhases":3}]
+    assert c.last_command["transaction_id"]=="42"
+    await c.request_stop_transaction(protocol="ocpp1.6", station_id=sid, transaction_id="42")
+    assert c._command_client._request.call_args.kwargs["json"]=={"transactionId":42}
+    await c.clear_charging_profile(protocol="ocpp1.6", station_id=sid, profile_id=9001)
+    call=c._command_client._request.call_args
+    assert call.args[1]=="/ocpp/1.6/smartcharging/clearChargingProfile" and call.kwargs["json"]=={"id":9001}
+    sent=c._command_client._request.await_count
+    for periods, tx in [([power_period(0, 5000)], "42"), ([charge_period(0, 7000, 3)], "uuid-1"),
+                        ([{"startPeriod":0,"limit":0,"numberPhases":1,"phaseToUse":2}], "42")]:
+        with pytest.raises(CitrineCompatibilityError):
+            await c.submit_schedule(protocol="ocpp1.6", station_id=sid, transaction_id=tx,
+                                    periods=periods, immediate=True)
+    assert c._command_client._request.await_count==sent
+
+
+def test_real_client_ocpp16_wire_payloads_pass_pinned_gateway_policy():
+    source=os.environ.get("CITRINE_APP_SOURCE")
+    if not source:
+        pytest.skip("Set CITRINE_APP_SOURCE for the cross-repository wire contract")
+    policy_file=(Path(source)/"citrineos_server/rootfs/control-policy.mjs").resolve()
+    script="""const {validateCommand,routesFor,STATION}=await import(process.argv[1]);
+let text='';for await(const c of process.stdin)text+=c;
+for(const [i,p] of JSON.parse(text)) {
+  const u=new URL('http://lab'+routesFor('ocpp1.6')[i]+'?identifier='+STATION+'&tenantId=1');
+  if(!validateCommand(u,p))process.exit(1);
+}"""
+    start={"remoteStartId":1,"evseId":1,"idToken":{"idToken":"C17E0001","type":"ISO14443"}}
+    profile=build_profile("42",[charge_period(0,7000.3,3),charge_period(60,0)],immediate=True)
+    payloads=[[0,to_ocpp16("start",start)],[1,to_ocpp16("stop",{"transactionId":"42"})],
+              [2,to_ocpp16("profile",profile)],[3,to_ocpp16("clear",{"chargingProfileId":9001})]]
+    subprocess.run(["node","--input-type=module","-e",script,policy_file.as_uri()],
+                   input=json.dumps(payloads),text=True,check=True,capture_output=True)

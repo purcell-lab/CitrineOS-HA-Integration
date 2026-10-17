@@ -1,7 +1,8 @@
 """Single-attempt control path for one command station. No legacy mutation fallbacks.
 
 The station is a SIM-EV- simulator, or a physical charger when the server reports
-real_devices_enabled (citrineos_server 0.6.0 command_real_stations_enabled).
+real_devices_enabled (citrineos_server 0.6.0 command_real_stations_enabled). Commands
+use the station's observed OCPP version: 2.1, or charging-only 2.0.1 or 1.6.
 """
 from __future__ import annotations
 
@@ -25,7 +26,14 @@ STATION_PATTERN = re.compile(r"SIM-EV-[A-Za-z0-9_-]{1,36}")
 REAL_STATION_PATTERN = re.compile(r"[A-Za-z0-9._~*+-]{1,48}")
 PROTOCOL = "ocpp2.1"
 # Servers before citrineos_server 0.6.0 report only OCPP 2.1.
-PROTOCOLS = ("ocpp2.1", "ocpp2.0.1")
+PROTOCOLS = ("ocpp2.1", "ocpp2.0.1", "ocpp1.6")
+# OCPP 1.6 names the remote start and stop messages differently.
+PATHS_16 = {
+    "start": "/ocpp/1.6/evdriver/remoteStartTransaction",
+    "stop": "/ocpp/1.6/evdriver/remoteStopTransaction",
+    "profile": "/ocpp/1.6/smartcharging/setChargingProfile",
+    "clear": "/ocpp/1.6/smartcharging/clearChargingProfile",
+}
 PROFILE_ID = 9001
 # Lab bounds per period, charging (import) and V2G discharge (export).
 # citrineos_server 0.5.3 raised both from 11 kW to 25 kW for a 3-phase 32 A
@@ -43,6 +51,8 @@ PATHS = {
 
 def paths_for(protocol):
     """The scoped command routes for an OCPP version, e.g. /ocpp/2.0.1/... for ocpp2.0.1."""
+    if protocol == "ocpp1.6":
+        return dict(PATHS_16)
     return {k: v.replace("/ocpp/2.1/", f"/ocpp/{protocol.removeprefix('ocpp')}/") for k, v in PATHS.items()}
 
 
@@ -118,6 +128,42 @@ def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_I
         "chargingSchedule": [{"id": profile_id, "startSchedule": start_at.isoformat(timespec="milliseconds"),
                               "duration": duration, "chargingRateUnit": "W",
                               "chargingSchedulePeriod": normalized}],
+    }}
+
+
+def to_ocpp16(action, payload):
+    """Rewrite a 2.x-shaped lab command as its OCPP 1.6 message.
+
+    1.6 has integer transaction IDs, connectorId for evseId, one schedule per
+    profile, no setpoints, and limits in multiples of 0.1 (sent as whole watts).
+    """
+    def tx_int(value):
+        if not isinstance(value, str) or not re.fullmatch(r"\d{1,10}", value) or int(value) > 2147483647:
+            raise CitrineCompatibilityError("OCPP 1.6 needs an integer transaction ID")
+        return int(value)
+
+    if action == "start":
+        return {"connectorId": payload["evseId"], "idTag": payload["idToken"]["idToken"]}
+    if action == "stop":
+        return {"transactionId": tx_int(payload["transactionId"])}
+    if action == "clear":
+        return {"id": payload["chargingProfileId"]}
+    c = payload["chargingProfile"]
+    schedule = c["chargingSchedule"][0]
+    periods = []
+    for p in schedule["chargingSchedulePeriod"]:
+        if set(p) - {"startPeriod", "limit", "numberPhases"}:
+            raise CitrineCompatibilityError(
+                "OCPP 1.6 accepts charging-only periods (limit and numberPhases)")
+        periods.append({**p, "limit": round(p["limit"])})
+    return {"connectorId": payload["evseId"], "csChargingProfiles": {
+        "chargingProfileId": c["id"], "stackLevel": c["stackLevel"],
+        "chargingProfilePurpose": c["chargingProfilePurpose"],
+        "chargingProfileKind": c["chargingProfileKind"],
+        "transactionId": tx_int(c["transactionId"]),
+        "chargingSchedule": {k: schedule[k] for k in (
+            "startSchedule", "duration", "chargingRateUnit") if k in schedule}
+        | {"chargingSchedulePeriod": periods},
     }}
 
 
@@ -231,6 +277,8 @@ class ScopedLabClient(CitrineClient):
             raise CitrineApiError("Previous outcome unresolved; reconcile before further commands")
         if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == "dispatched_awaiting_station_evidence":
             raise CitrineApiError("Start already dispatched; wait for the transaction instead of retrying")
+        # Translate before any state change, so an untranslatable command is refused cleanly.
+        body = to_ocpp16(action, payload) if protocol == "ocpp1.6" else payload
         async with self._command_lock:
             await self.control_policy()
             self.last_command = {"action": action, "state": "dispatching",
@@ -242,7 +290,7 @@ class ScopedLabClient(CitrineClient):
             try:
                 response = await self._command_client._request(
                     "POST", paths_for(protocol)[action],
-                    params={"identifier": self.station, "tenantId": 1}, json=payload)
+                    params={"identifier": self.station, "tenantId": 1}, json=body)
             except CitrineApiError as err:
                 status = getattr(err, "status", None)
                 # A 4xx is refused before dispatch. A 500 on a profile is safe to follow with the
@@ -286,9 +334,10 @@ class ScopedLabClient(CitrineClient):
     async def submit_schedule(self, *, protocol, station_id, transaction_id, periods,
                               duration=240, profile_id=PROFILE_ID, stack_level=1, start_at=None,
                               immediate=False):
-        if protocol == "ocpp2.0.1" and any(
+        if protocol in ("ocpp2.0.1", "ocpp1.6") and any(
                 isinstance(x, dict) and {"operationMode", "setpoint", "dischargeLimit"} & set(x) for x in periods or []):
-            raise CitrineCompatibilityError("OCPP 2.0.1 accepts charging-only periods (no setpoint or discharge)")
+            raise CitrineCompatibilityError(
+                f"OCPP {protocol.removeprefix('ocpp')} accepts charging-only periods (no setpoint or discharge)")
         payload = build_profile(transaction_id, periods, duration=duration, profile_id=profile_id,
                                 stack_level=stack_level, start_at=start_at, immediate=immediate)
         return await self._dispatch("profile", payload, protocol=protocol, station_id=station_id)
