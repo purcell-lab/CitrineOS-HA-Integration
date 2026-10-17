@@ -19,6 +19,11 @@ STATION = "SIM-EV-EVEREST-V2G-01"
 STATION_PATTERN = re.compile(r"SIM-EV-[A-Za-z0-9_-]{1,36}")
 PROTOCOL = "ocpp2.1"
 PROFILE_ID = 9001
+# Charging (import) per period; the server raised it from 11 kW to 23 kW in
+# citrineos_server 0.5.3 for a 3-phase 32 A AC simulator. V2G discharge stays 11 kW.
+MAX_IMPORT_W = 23000
+MAX_EXPORT_W = 11000
+KNOWN_IMPORT_W = (11000, MAX_IMPORT_W)
 PATHS = {
     "start": "/ocpp/2.1/evdriver/requestStartTransaction",
     "stop": "/ocpp/2.1/evdriver/requestStopTransaction",
@@ -46,11 +51,11 @@ def valid_period(p):
     Mirrors the lab server policy: charging-only periods carry a limit and
     optionally numberPhases 1 or 3, with phaseToUse (1-3) only for one phase.
     """
-    if not isinstance(p, dict) or not number(p.get("limit"), 0, 11000):
+    if not isinstance(p, dict) or not number(p.get("limit"), 0, MAX_IMPORT_W):
         return False
     if p.get("operationMode") == "CentralSetpoint":
         return (not set(p) - {"startPeriod", "limit", "dischargeLimit", "setpoint", "operationMode"}
-                and number(p.get("dischargeLimit"), -11000, 0)
+                and number(p.get("dischargeLimit"), -MAX_EXPORT_W, 0)
                 and number(p.get("setpoint"), p["dischargeLimit"], p["limit"]))
     if set(p) - {"startPeriod", "limit", "numberPhases", "phaseToUse"}:
         return False
@@ -167,7 +172,7 @@ class ScopedLabClient(CitrineClient):
                 or not STATION_PATTERN.fullmatch(p["station_id"])
                 or (self._station_learned and p["station_id"] != self.station)
                 or p.get("protocol") != PROTOCOL
-                or p.get("max_import_w") != 11000 or p.get("max_export_w") != 11000
+                or p.get("max_import_w") not in KNOWN_IMPORT_W or p.get("max_export_w") != MAX_EXPORT_W
                 or p.get("max_profile_seconds") != 600 or p.get("max_periods") != 10
                 or p.get("automatic_control") is not False
                 or p.get("clear_requires_closed_transaction") is not True

@@ -61,7 +61,7 @@ def test_ac_charging_only_limits_and_phases():
 
 
 @pytest.mark.parametrize("bad", [
-    {"startPeriod":0,"limit":11001},
+    {"startPeriod":0,"limit":23001},
     {"startPeriod":0,"limit":1000,"numberPhases":2},
     {"startPeriod":0,"limit":1000,"phaseToUse":1},
     {"startPeriod":0,"limit":1000,"numberPhases":3,"phaseToUse":1},
@@ -154,6 +154,23 @@ async def test_ambiguous_dispatch_response_is_not_success(response):
     with pytest.raises(CitrineApiError):
         await c.request_start_transaction(protocol=PROTOCOL,station_id=STATION)
     assert c.last_command["state"]=="dispatch_not_confirmed"
+
+
+def test_three_phase_ac_limit_up_to_23_kw():
+    sched=build_profile("t",[charge_period(0,22080,3)])["chargingProfile"]["chargingSchedule"][0]
+    assert sched["chargingSchedulePeriod"][0]["limit"]==22080
+    with pytest.raises(CitrineCompatibilityError):
+        build_profile("t",[charge_period(0,23001,3)])
+    with pytest.raises(CitrineCompatibilityError):
+        build_profile("t",[{"startPeriod":0,"limit":20000,"dischargeLimit":-11001,"setpoint":0,"operationMode":"CentralSetpoint"}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_import", [11000, 23000])
+async def test_policy_accepts_old_and_raised_import_bound(max_import):
+    c=client();p=policy();p["max_import_w"]=max_import
+    c._command_client._request=AsyncMock(return_value=p)
+    assert (await c.control_policy())["max_import_w"]==max_import
 
 
 @pytest.mark.asyncio
