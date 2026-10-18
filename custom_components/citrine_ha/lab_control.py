@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import logging
 from datetime import UTC, datetime, timedelta
 import math
 import re
@@ -15,9 +16,12 @@ from typing import Any
 
 from .citrine_api import (
     CitrineClient, CitrineApiError, CitrineAuthError,
-    CitrineCompatibilityError, CitrineReadOnlyError,
+    CitrineCompatibilityError, CitrineHttpError, CitrineNotReadyError,
+    CitrineReadOnlyError, CitrineTransportError,
 )
 from .compatibility import PROFILE_LAB, PROFILE_V2
+
+_LOGGER = logging.getLogger(__name__)
 
 STATION = "SIM-EV-EVEREST-V2G-01"
 # The server names its single command station: a simulator identity, or any OCPP
@@ -35,6 +39,31 @@ PATHS_16 = {
     "clear": "/ocpp/1.6/smartcharging/clearChargingProfile",
 }
 PROFILE_ID = 9001
+# A dispatched command with no station evidence after this window ends as
+# no_station_evidence (a new Start is then allowed). Reconcile also waits this
+# long after dispatch, so a command that may still land is never discarded.
+EVIDENCE_TIMEOUT_S = 90
+# States that block every command except Stop until reconciled.
+UNRESOLVED = ("outcome_unknown", "dispatch_not_confirmed")
+AWAITING = "dispatched_awaiting_station_evidence"
+
+
+class CitrineUnavailableError(CitrineApiError):
+    """The CSMS failed its readiness check; lab commands fail fast until it recovers."""
+
+
+def csms_down(err):
+    """A readiness failure, 5xx or transport error: the CSMS, not the request, is at fault."""
+    return (isinstance(err, (CitrineTransportError, CitrineNotReadyError, CitrineUnavailableError))
+            or (isinstance(err, CitrineHttpError) and err.status >= 500))
+
+
+def _parse_time(value):
+    try:
+        stamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo is not None else None
 # Lab bounds per period, charging (import) and V2G discharge (export).
 # citrineos_server 0.5.3 raised both from 11 kW to 25 kW for a 3-phase 32 A
 # AC simulator; older servers still report 11 kW.
@@ -207,22 +236,145 @@ class ScopedLabClient(CitrineClient):
         self.protocols = (PROTOCOL,)
         self.real_devices = False
         self.last_command: dict[str, Any] = {"state": "not_sent"}
+        self.evidence_timeout = EVIDENCE_TIMEOUT_S
+        # Unknown until the first readiness check; only a failed check blocks commands.
+        self.csms_available = True
+        self.csms_unavailable_reason: str | None = None
+        self.csms_unavailable_since: str | None = None
 
-    def observe_transaction(self, station):
+    def _csms_unavailable(self, err):
+        reason = str(err)
+        if self.csms_available:
+            # One warning per outage, not one per poll.
+            _LOGGER.warning("CSMS unavailable (%s); lab commands fail fast until /health/ready passes", reason)
+            self.csms_unavailable_since = datetime.now(UTC).isoformat()
+        self.csms_available = False
+        self.csms_unavailable_reason = reason
+
+    def _csms_recovered(self):
+        if not self.csms_available:
+            _LOGGER.info("CSMS available again after %s; lab commands re-enabled",
+                         self.csms_unavailable_reason)
+        self.csms_available = True
+        self.csms_unavailable_reason = None
+        self.csms_unavailable_since = None
+
+    def require_csms(self):
+        if not self.csms_available:
+            raise CitrineUnavailableError(
+                f"CSMS unavailable ({self.csms_unavailable_reason}); lab commands are blocked "
+                "until /health/ready passes")
+
+    async def _csms_call(self, awaitable):
+        """Run a CSMS read; a readiness, 5xx or transport failure marks the CSMS unavailable."""
+        try:
+            return await awaitable
+        except CitrineApiError as err:
+            if not csms_down(err):
+                raise
+            self._csms_unavailable(err)
+            raise CitrineUnavailableError(
+                f"CSMS unavailable ({err}); lab commands are blocked until /health/ready passes") from err
+
+    def _age(self, now=None):
+        """Seconds since the last command was dispatched, or None."""
+        lc = self.last_command
+        since = _parse_time(lc.get("dispatch_response_at") or lc.get("dispatched_at"))
+        return None if since is None else ((now or datetime.now(UTC)) - since).total_seconds()
+
+    def expire_awaiting(self, now=None):
+        """End a dispatch that produced no station evidence within the window.
+
+        Start and Stop expect lifecycle evidence (a transaction, or its closure);
+        profile and clear outcomes are never observed, so they end here too.
+        """
+        lc = self.last_command
+        age = self._age(now)
+        if lc.get("state") != AWAITING or age is None or age < self.evidence_timeout:
+            return False
+        action = lc.get("action")
+        detail = f"No station evidence within {self.evidence_timeout} s of dispatch"
+        if action == "start":
+            detail += "; a new Start is allowed"
+        lc.update(state="no_station_evidence", previous_state=AWAITING, detail=detail,
+                  expired_at=(now or datetime.now(UTC)).isoformat())
+        log = _LOGGER.warning if action in ("start", "stop") else _LOGGER.debug
+        log("Lab %s on %s: %s", action, lc.get("station_id", self.station), detail)
+        return True
+
+    def observe_transaction(self, station, now=None):
         """Resolve only observed lifecycle states, never invent profile acceptance."""
-        if station.get("id") != self.station or station.get("protocol") not in self.protocols:
-            return
-        active = station.get("activeTransactionId")
-        meter = station.get("lab_meter", {})
-        action = self.last_command.get("action")
-        if action == "start" and active:
-            self.last_command.update(state="transaction_observed", transaction_id=active,
-                                     observed_at=datetime.now(UTC).isoformat())
-        elif (action == "stop" and not active
-              and meter.get("transaction_closed") is True
-              and meter.get("meter_transaction_id") == self.last_command.get("transaction_id")):
-            self.last_command.update(state="transaction_closure_observed",
-                                     observed_at=datetime.now(UTC).isoformat())
+        if station.get("id") == self.station and station.get("protocol") in self.protocols:
+            active = station.get("activeTransactionId")
+            meter = station.get("lab_meter", {})
+            action = self.last_command.get("action")
+            if action == "start" and active:
+                if self.last_command.get("state") == "no_station_evidence":
+                    _LOGGER.info("Lab start: transaction %s observed after the evidence window", active)
+                self.last_command.update(state="transaction_observed", transaction_id=active,
+                                         observed_at=datetime.now(UTC).isoformat())
+            elif (action == "stop" and not active
+                  and meter.get("transaction_closed") is True
+                  and meter.get("meter_transaction_id") == self.last_command.get("transaction_id")):
+                self.last_command.update(state="transaction_closure_observed",
+                                         observed_at=datetime.now(UTC).isoformat())
+        self.expire_awaiting(now)
+
+    async def reconcile(self, station, now=None):
+        """Resolve an unresolved or awaiting outcome from freshly read CSMS state.
+
+        station is the command station's record from a refresh that just
+        succeeded. A command dispatched less than the evidence window ago may
+        still land, so it is never cleared: reconcile refuses instead.
+        """
+        if self.read_only:
+            raise CitrineReadOnlyError("Lab controls are disabled")
+        self.require_csms()
+        if self._command_lock.locked():
+            raise CitrineApiError("A lab command is in progress; reconcile after it returns")
+        if station.get("id") != self.station:
+            raise CitrineApiError(f"Fresh CSMS evidence for {self.station} is required to reconcile")
+        async with self._command_lock:
+            # Confirms the command path answers before anything is cleared.
+            await self._csms_call(self.control_policy())
+            self._csms_recovered()
+            now = now or datetime.now(UTC)
+            self.observe_transaction(station, now)
+            lc = self.last_command
+            state = lc.get("state")
+            if state not in (*UNRESOLVED, AWAITING):
+                lc["reconciled_at"] = now.isoformat()
+                return deepcopy(lc)
+            age = self._age(now)
+            if age is not None and age < self.evidence_timeout:
+                raise CitrineApiError(
+                    f"The {lc.get('action')} sent {round(age)} s ago may still be pending; "
+                    f"reconcile after {round(self.evidence_timeout - age)} s")
+            action = lc.get("action")
+            active = station.get("activeTransactionId")
+            sent_tx = lc.get("transaction_id")
+            if action == "start":
+                resolution = "no_transaction"
+                detail = "No transaction on the station after the evidence window; a new Start is allowed"
+            elif action == "stop":
+                if active and active == sent_tx:
+                    resolution = "transaction_still_active"
+                    detail = f"Transaction {active} is still active; Stop did not take effect"
+                else:
+                    resolution = "no_active_transaction"
+                    detail = "No active transaction; closure was not observed in the meter record"
+            else:
+                # The CSMS exposes no profile or clear outcome to this integration.
+                resolution = "outcome_not_observable"
+                detail = (f"{action} outcome is not observable; profile {PROFILE_ID} at the same stack "
+                          "level is replaced by the next schedule and ends with its transaction")
+                if action == "profile" and sent_tx and active != sent_tx:
+                    detail += f"; transaction {sent_tx} is no longer active"
+            lc.update(state="reconciled", previous_state=state, resolution=resolution,
+                      active_transaction_id=active, reconciled_at=now.isoformat(), detail=detail)
+            _LOGGER.warning("Lab %s on %s reconciled from %s: %s",
+                            action, self.station, state, detail)
+            return deepcopy(lc)
 
     async def _request(self, method, path, **kwargs):
         # Any inherited legacy operation fails before network I/O.
@@ -262,10 +414,14 @@ class ScopedLabClient(CitrineClient):
         self.real_devices = real
         return p
 
-    async def ping(self):
+    async def _ping(self):
         await super().ping()
         if not self.read_only:
             await self.control_policy()
+
+    async def ping(self):
+        await self._csms_call(self._ping())
+        self._csms_recovered()
 
     async def _dispatch(self, action, payload, *, protocol, station_id):
         if protocol not in self.protocols or station_id != self.station:
@@ -273,14 +429,23 @@ class ScopedLabClient(CitrineClient):
                 "The enrolled command station on an observed protocol the server accepts is required")
         if self._command_lock.locked():
             raise CitrineApiError("A lab command is already in progress")
-        if action != "stop" and self.last_command.get("state") in ("outcome_unknown", "dispatch_not_confirmed"):
-            raise CitrineApiError("Previous outcome unresolved; reconcile before further commands")
-        if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == "dispatched_awaiting_station_evidence":
-            raise CitrineApiError("Start already dispatched; wait for the transaction instead of retrying")
+        self.require_csms()
+        self.expire_awaiting()
+        if action != "stop" and self.last_command.get("state") in UNRESOLVED:
+            raise CitrineApiError(
+                "Previous outcome unresolved; reconcile before further commands "
+                "(citrine_ha.lab_reconcile or the Reconcile command state button)")
+        if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == AWAITING:
+            remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
+            raise CitrineApiError(
+                f"Start already dispatched; wait up to {remaining} s for the transaction instead of retrying")
         # Translate before any state change, so an untranslatable command is refused cleanly.
         body = to_ocpp16(action, payload) if protocol == "ocpp1.6" else payload
         async with self._command_lock:
-            await self.control_policy()
+            # Fail fast, before any state change, while the CSMS is restarting.
+            await self._csms_call(self.ready())
+            await self._csms_call(self.control_policy())
+            self._csms_recovered()
             self.last_command = {"action": action, "state": "dispatching",
                                  "dispatched_at": datetime.now(UTC).isoformat(),
                                  "station_id": self.station}

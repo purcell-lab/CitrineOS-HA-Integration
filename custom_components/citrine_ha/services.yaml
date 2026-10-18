@@ -373,3 +373,11 @@ lab_schedule:
       selector:
         boolean:
 
+lab_reconcile:
+  name: Reconcile scoped lab command state
+  description: Re-read the CSMS (readiness, command policy and the command station's active transaction) and resolve an outcome_unknown, dispatch_not_confirmed or awaiting-evidence command without reloading the integration. A command sent less than 90 seconds ago may still land and is never cleared; the call fails with the remaining wait instead. Returns the resolved command state.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
