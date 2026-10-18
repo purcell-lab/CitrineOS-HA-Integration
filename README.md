@@ -85,6 +85,89 @@ Selectable on the fly via `select.citrine_controller_mode`:
 
 ---
 
+## Dynamic pricing (0.6.0, scoped lab profile)
+
+Amber Electric prices in Home Assistant can be sent to the lab command station
+as OCPP price information. Nothing here changes charging power. It needs
+citrineos_server 0.7.0 with `price_commands_enabled: true`: the integration
+reads the optional `price_commands` key of `GET /lab/control-policy`. When the key
+is missing, disabled or malformed, price features are off and everything else
+works as before.
+
+| Service | Message | Stations |
+| --- | --- | --- |
+| `citrine_ha.lab_schedule` + `price_entity` | TxProfile with `absolutePriceSchedule` (one rule stack per Amber interval, current first, up to `max_rule_stacks` and 48 h) | command station, OCPP 2.1 |
+| `citrine_ha.lab_cost_update` | `CostUpdated` with California Pricing `customData`: current price, the next interval as `nextPeriod`, and text such as "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" | command station, OCPP 2.1 or 2.0.1, active transaction |
+| `citrine_ha.lab_default_tariff` | `SetDefaultTariff`: Amber intervals as `energy.prices[]` with local start/end time of day and dates, priceKwh = Amber ÷ 1.1 (5 dp), GST 10 %; an optional feed-in sensor adds export entries (`minPower: -1, maxPower: -1000000`, priceKwh = −feed-in ÷ 1.1) | a station in `tariff_stations` (default the command station), OCPP 2.1 |
+
+**OpenADR 3 VEN sensors (preferred).** A price sensor from the `openadr3_ven`
+integration (for example `sensor.openadr3_vtn_..._price` and `..._export_price`,
+`payload_type` PRICE / EXPORT_PRICE) is read through its `openadr3_ven.get_forecast`
+service: the next 48 h at the VTN's native granularity (5- then 30-minute intervals).
+Values are AUD/kWh including GST. The price text, price schedule description and
+tariff ID then say "OpenADR" (`openadr-YYYYMMDD-HHMM`).
+
+Amber sensors: the core `amberelectric` forecast sensors (`forecasts[]`) and
+price sensors (one current interval), and `amber_express`
+(`detailedForecast[]`, current price in the state). Past intervals and
+intervals with no price are skipped; negative prices are kept. The core
+forecast sensors list future intervals only, so `lab_cost_update` needs the
+core *price* sensor or `amber_express`. Price schedule fees are RationalNumbers
+with exponent −3 (0.1 c/kWh precision, AUD/kWh incl. GST). CostUpdated and
+tariff prices outside the server's bounds (−5 to 20 AUD/kWh) are clamped; the
+price text keeps the real Amber price. Tariff times use HA's time zone, and an
+interval crossing midnight is split in two (validToDate is exclusive).
+
+Each service returns `sent` (a summary), `command_state` and, for a tariff,
+`station_status` (`Accepted`, `Rejected`, `CALLERROR NotImplemented`, ...)
+with the verbatim `station_response`. Price messages go through the same
+single-command path as the other lab commands: a timeout or 502 to 504 is
+`outcome_unknown` and needs `lab_reconcile` (a tariff 502 means CitrineOS did
+not send it, so it is `rejected`). Price features off, a non-2.1 station for a
+price schedule or tariff, no active transaction for a cost update, or a
+station outside `tariff_stations` fail with a validation error before
+anything is sent.
+
+```yaml
+alias: CitrineOS lab - OpenADR prices to the station
+mode: queued
+triggers:
+  - trigger: state
+    entity_id: sensor.openadr3_vtn_example_price
+actions:
+  - action: citrine_ha.lab_cost_update
+    continue_on_error: true   # no active transaction is a validation error
+    data:
+      entry_id: "<the isolated CitrineOS entry ID>"
+      price_entity: sensor.openadr3_vtn_example_price
+  - action: citrine_ha.lab_default_tariff
+    data:
+      entry_id: "<the isolated CitrineOS entry ID>"
+      price_entity: sensor.openadr3_vtn_example_price
+      export_price_entity: sensor.openadr3_vtn_example_export_price
+      intervals: 48
+    response_variable: tariff
+  - action: system_log.write
+    data:
+      message: "SetDefaultTariff {{ tariff.sent.tariff_id }}: {{ tariff.station_status }}"
+```
+
+A schedule with the forecast attached as an absolutePriceSchedule:
+
+```yaml
+action: citrine_ha.lab_schedule
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+  immediate: true
+  duration: 240
+  price_entity: sensor.openadr3_vtn_example_price
+  periods:
+    - {startPeriod: 0, limit: 11000, dischargeLimit: -11000, setpoint: 6000, operationMode: CentralSetpoint}
+response_variable: schedule   # schedule.sent.price_schedule: id, rule stacks, horizon
+```
+
+---
+
 ## Lovelace Dashboard & Automation Blueprints
 
 ### Turnkey Dashboard Card

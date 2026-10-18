@@ -85,5 +85,81 @@
         }
       }
     }
+  },
+  "services": {
+    "lab_schedule": {
+      "name": "Submit scoped lab schedule",
+      "description": "Send one bounded schedule to the active lab transaction, optionally with an OCPP 2.1 absolutePriceSchedule from an Amber forecast.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "periods": {
+          "name": "Periods",
+          "description": "CentralSetpoint or charging-only limit periods (W, at most 10)."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Schedule length, 1 to 600 seconds."
+        },
+        "immediate": {
+          "name": "Immediate",
+          "description": "Start the schedule now so a replacement leaves no gap."
+        },
+        "price_entity": {
+          "name": "Price entity",
+          "description": "Amber forecast sensor; attaches an absolutePriceSchedule (OCPP 2.1, price commands enabled)."
+        }
+      }
+    },
+    "lab_cost_update": {
+      "name": "Send scoped lab cost update",
+      "description": "Send CostUpdated with the current and next Amber price for the command station's active transaction.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "price_entity": {
+          "name": "Price entity",
+          "description": "Amber price sensor with a current interval (core price sensor or amber_express)."
+        },
+        "total_cost": {
+          "name": "Total cost",
+          "description": "Running session cost in AUD, 0 to 10000."
+        }
+      }
+    },
+    "lab_default_tariff": {
+      "name": "Send scoped lab default tariff",
+      "description": "Send SetDefaultTariff (OCPP 2.1) built from the Amber forecast to a listed tariff station.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "price_entity": {
+          "name": "Price entity",
+          "description": "Amber import forecast sensor."
+        },
+        "export_price_entity": {
+          "name": "Export price entity",
+          "description": "Amber feed-in forecast sensor (positive = paid to the customer)."
+        },
+        "station_id": {
+          "name": "Station ID",
+          "description": "A station in the App's tariff_stations; default the command station."
+        },
+        "evse_id": {
+          "name": "EVSE ID",
+          "description": "0 for the whole station."
+        },
+        "intervals": {
+          "name": "Intervals",
+          "description": "Amber intervals per forecast, limited by the App's max_prices."
+        }
+      }
+    }
   }
 }

@@ -372,6 +372,70 @@ lab_schedule:
       default: false
       selector:
         boolean:
+    price_entity:
+      required: false
+      selector:
+        entity:
+          domain: sensor
+
+lab_cost_update:
+  name: Send scoped lab cost update
+  description: Send CostUpdated with California Pricing customData (current Amber price, the next interval and a price text) for the command station's active transaction. OCPP 2.1 and 2.0.1; needs price commands enabled in the CitrineOS App. Information only; returns what was sent and the dispatch state.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    price_entity:
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    total_cost:
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 0.01
+          mode: box
+
+lab_default_tariff:
+  name: Send scoped lab default tariff
+  description: Send SetDefaultTariff (OCPP 2.1) built from the Amber forecast, AUD/kWh excluding GST with a GST 10 % tax rate, local times of day. Optional feed-in prices become export entries the station pays. Only stations listed in the App's tariff_stations; returns the station's status (Accepted, Rejected, CALLERROR NotImplemented ...).
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    price_entity:
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    export_price_entity:
+      required: false
+      selector:
+        entity:
+          domain: sensor
+    station_id:
+      required: false
+      selector:
+        text:
+    evse_id:
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10
+          mode: box
+    intervals:
+      default: 48
+      selector:
+        number:
+          min: 1
+          max: 288
+          mode: box
 
 lab_reconcile:
   name: Reconcile scoped lab command state

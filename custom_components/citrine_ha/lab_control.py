@@ -20,6 +20,10 @@ from .citrine_api import (
     CitrineReadOnlyError, CitrineTransportError,
 )
 from .compatibility import PROFILE_LAB, PROFILE_V2
+from .pricing import (
+    COST_PATHS, SCHEDULE_LIMITS, TARIFF_LIMITS, TARIFF_PATH, tariff_status,
+    valid_cost_updated, valid_price_schedule, valid_tariff,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +50,9 @@ EVIDENCE_TIMEOUT_S = 90
 # States that block every command except Stop until reconciled.
 UNRESOLVED = ("outcome_unknown", "dispatch_not_confirmed")
 AWAITING = "dispatched_awaiting_station_evidence"
+# Information-only price messages (citrineos_server 0.7.0 price_commands).
+PRICE_ACTIONS = ("cost_update", "tariff")
+PRICES_DISABLED = {"enabled": False}
 
 
 class CitrineUnavailableError(CitrineApiError):
@@ -76,6 +83,36 @@ PATHS = {
     "profile": "/ocpp/2.1/smartcharging/setChargingProfile",
     "clear": "/ocpp/2.1/smartcharging/clearChargingProfile",
 }
+
+
+def parse_price_commands(policy):
+    """Normalise the policy's optional price_commands key. Never raises.
+
+    Absent, disabled or malformed means price features off; it never affects
+    the exact compatibility check on the rest of the policy.
+    """
+    p = policy.get("price_commands") if isinstance(policy, dict) else None
+    if not isinstance(p, dict) or p.get("enabled") is not True:
+        return dict(PRICES_DISABLED)
+    schedule, limits = p.get("price_schedule", {}), p.get("tariff_limits", {})
+    cost = p.get("cost_updated_by_protocol")
+    stations = p.get("tariff_stations", [])
+    if not isinstance(schedule, dict) or not isinstance(limits, dict):
+        return {**PRICES_DISABLED, "invalid": True}
+    schedule, limits = {**SCHEDULE_LIMITS, **schedule}, {**TARIFF_LIMITS, **limits}
+    if (not isinstance(p.get("currency"), str) or not re.fullmatch(r"[A-Z]{3}", p["currency"])
+            or not all(integer(schedule[k], 1, 1_000_000) for k in SCHEDULE_LIMITS)
+            or not integer(limits["max_prices"], 1, 1000)
+            or not number(limits["min_price_kwh"], -1000, 0) or not number(limits["max_price_kwh"], 0, 1000)
+            # Only the known routes: a policy cannot point a price message elsewhere.
+            or not isinstance(cost, dict) or any(COST_PATHS.get(k) != v for k, v in cost.items())
+            or p.get("default_tariff") not in (None, TARIFF_PATH)
+            or not isinstance(stations, list)
+            or not all(isinstance(x, str) and REAL_STATION_PATTERN.fullmatch(x) for x in stations)):
+        return {**PRICES_DISABLED, "invalid": True}
+    return {"enabled": True, "currency": p["currency"], "price_schedule": schedule,
+            "cost_updated_by_protocol": dict(cost), "default_tariff": p.get("default_tariff"),
+            "tariff_limits": limits, "tariff_stations": list(stations)}
 
 
 def paths_for(protocol):
@@ -120,11 +157,12 @@ def valid_period(p):
 
 
 def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_ID,
-                  stack_level=1, start_at=None, immediate=False):
+                  stack_level=1, start_at=None, immediate=False, price_schedule=None):
     """Produce one bounded absolute TxProfile, never a default/station profile.
 
     immediate starts the schedule one second ago, so a replacement profile
-    leaves no unlimited gap before its first period.
+    leaves no unlimited gap before its first period. price_schedule is an
+    OCPP 2.1 absolutePriceSchedule carried for information only.
     """
     if (not transaction(transaction_id) or not integer(duration, 1, 600)
             or not integer(profile_id, 1, 2147483647) or not integer(stack_level, 0, 10)
@@ -150,13 +188,14 @@ def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_I
                 "Invalid lab period: W bounds, and CentralSetpoint or a charging-only limit")
         last = p["startPeriod"]
         normalized.append(dict(p))
+    schedule = {"id": profile_id, "startSchedule": start_at.isoformat(timespec="milliseconds"),
+                "duration": duration, "chargingRateUnit": "W", "chargingSchedulePeriod": normalized}
+    if price_schedule is not None:
+        schedule["absolutePriceSchedule"] = deepcopy(price_schedule)
     return {"evseId": 1, "chargingProfile": {
         "id": profile_id, "stackLevel": stack_level,
         "chargingProfilePurpose": "TxProfile", "chargingProfileKind": "Absolute",
-        "transactionId": transaction_id,
-        "chargingSchedule": [{"id": profile_id, "startSchedule": start_at.isoformat(timespec="milliseconds"),
-                              "duration": duration, "chargingRateUnit": "W",
-                              "chargingSchedulePeriod": normalized}],
+        "transactionId": transaction_id, "chargingSchedule": [schedule],
     }}
 
 
@@ -235,6 +274,8 @@ class ScopedLabClient(CitrineClient):
         self._station_learned = False
         self.protocols = (PROTOCOL,)
         self.real_devices = False
+        # Off until a policy reports price_commands enabled.
+        self.price_commands: dict[str, Any] = dict(PRICES_DISABLED)
         self.last_command: dict[str, Any] = {"state": "not_sent"}
         self.evidence_timeout = EVIDENCE_TIMEOUT_S
         # Unknown until the first readiness check; only a failed check blocks commands.
@@ -363,6 +404,10 @@ class ScopedLabClient(CitrineClient):
                 else:
                     resolution = "no_active_transaction"
                     detail = "No active transaction; closure was not observed in the meter record"
+            elif action in PRICE_ACTIONS:
+                resolution = "outcome_not_observable"
+                detail = (f"{action} outcome is not observable; it carries prices only and the "
+                          f"next {action} replaces it")
             else:
                 # The CSMS exposes no profile or clear outcome to this integration.
                 resolution = "outcome_not_observable"
@@ -412,6 +457,10 @@ class ScopedLabClient(CitrineClient):
         self._station_learned = True
         self.protocols = tuple(protocols)
         self.real_devices = real
+        prices = parse_price_commands(p)
+        if prices.get("invalid") and not self.price_commands.get("invalid"):
+            _LOGGER.warning("Server price_commands policy is malformed; price commands stay disabled")
+        self.price_commands = prices
         return p
 
     async def _ping(self):
@@ -423,8 +472,31 @@ class ScopedLabClient(CitrineClient):
         await self._csms_call(self._ping())
         self._csms_recovered()
 
+    def price_path(self, action, protocol, station_id, prices=None):
+        """The policy route for a price message, or CitrineCompatibilityError."""
+        prices = prices or self.price_commands
+        if not prices.get("enabled"):
+            raise CitrineCompatibilityError("Price commands are disabled by the server policy")
+        if action == "cost_update":
+            path = prices["cost_updated_by_protocol"].get(protocol)
+            if station_id != self.station or not path:
+                raise CitrineCompatibilityError(
+                    "CostUpdated needs the command station on a protocol the price policy lists")
+            return path
+        if (protocol != PROTOCOL or not prices.get("default_tariff")
+                or station_id not in prices["tariff_stations"]):
+            raise CitrineCompatibilityError(
+                "SetDefaultTariff needs an OCPP 2.1 station listed in the policy's tariff_stations")
+        return prices["default_tariff"]
+
     async def _dispatch(self, action, payload, *, protocol, station_id):
-        if protocol not in self.protocols or station_id != self.station:
+        price = action in PRICE_ACTIONS
+        if price:
+            # Only SetDefaultTariff may go to another station (a listed tariff station).
+            self.price_path(action, protocol, station_id)
+            if protocol not in self.protocols and action == "cost_update":
+                raise CitrineCompatibilityError("The command station's observed protocol is required")
+        elif protocol not in self.protocols or station_id != self.station:
             raise CitrineCompatibilityError(
                 "The enrolled command station on an observed protocol the server accepts is required")
         if self._command_lock.locked():
@@ -439,35 +511,56 @@ class ScopedLabClient(CitrineClient):
             remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
             raise CitrineApiError(
                 f"Start already dispatched; wait up to {remaining} s for the transaction instead of retrying")
+        if (price and self.last_command.get("action") in ("start", "stop")
+                and self.last_command.get("state") == AWAITING):
+            # A price message would replace the Start/Stop evidence being awaited.
+            remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
+            raise CitrineApiError(
+                f"A {self.last_command['action']} awaits station evidence; send prices after it "
+                f"resolves (up to {remaining} s)")
         # Translate before any state change, so an untranslatable command is refused cleanly.
         body = to_ocpp16(action, payload) if protocol == "ocpp1.6" else payload
         async with self._command_lock:
             # Fail fast, before any state change, while the CSMS is restarting.
             await self._csms_call(self.ready())
-            await self._csms_call(self.control_policy())
+            policy = await self._csms_call(self.control_policy())
             self._csms_recovered()
+            # The fresh policy decides the route; a price switch turned off since is honoured.
+            path = (self.price_path(action, protocol, station_id, parse_price_commands(policy))
+                    if price else paths_for(protocol)[action])
             self.last_command = {"action": action, "state": "dispatching",
                                  "dispatched_at": datetime.now(UTC).isoformat(),
-                                 "station_id": self.station}
+                                 "station_id": station_id}
             tx = payload.get("transactionId") or payload.get("chargingProfile", {}).get("transactionId")
             if tx:
                 self.last_command["transaction_id"] = tx
             try:
                 response = await self._command_client._request(
-                    "POST", paths_for(protocol)[action],
-                    params={"identifier": self.station, "tenantId": 1}, json=body)
+                    "POST", path, params={"identifier": station_id, "tenantId": 1}, json=body)
             except CitrineApiError as err:
                 status = getattr(err, "status", None)
                 # A 4xx is refused before dispatch. A 500 on a profile is safe to follow with the
                 # next profile: it has the same id and stack level, so it replaces whatever was
-                # applied. Timeouts, transport errors and 502-504 may follow dispatch.
-                if status is not None and (400 <= status < 500 or (status == 500 and action == "profile")):
+                # applied; the same holds for the next price message. Timeouts, transport errors
+                # and 502-504 may follow dispatch.
+                # For SetDefaultTariff the gateway answers 502 only when CitrineOS did not send
+                # it (504: sent, no station reply in 8 s, stays unknown).
+                if status is not None and (400 <= status < 500 or (
+                        status == 500 and action in ("profile", *PRICE_ACTIONS))
+                        or (status == 502 and action == "tariff")):
                     self.last_command.update(state="rejected", http_status=status,
                                              detail="Server refused the command; no automatic retry.")
                     raise
                 self.last_command.update(state="outcome_unknown",
                                          detail="Reconcile the station before another command; no automatic retry.")
                 raise
+            # SetDefaultTariff: the gateway passes the station's reply back verbatim.
+            station_status = tariff_status(response) if action == "tariff" else None
+            if station_status is not None:
+                self.last_command.update(state="station_responded", station_status=station_status,
+                                         station_response=deepcopy(response),
+                                         dispatch_response_at=datetime.now(UTC).isoformat())
+                return deepcopy(self.last_command)
             # Native API confirms message dispatch, not the EVSE's CALLRESULT.
             if (not isinstance(response, list) or len(response) != 1
                     or not isinstance(response[0], dict) or response[0].get("success") is not True):
@@ -498,14 +591,40 @@ class ScopedLabClient(CitrineClient):
 
     async def submit_schedule(self, *, protocol, station_id, transaction_id, periods,
                               duration=240, profile_id=PROFILE_ID, stack_level=1, start_at=None,
-                              immediate=False):
+                              immediate=False, price_schedule=None):
         if protocol in ("ocpp2.0.1", "ocpp1.6") and any(
                 isinstance(x, dict) and {"operationMode", "setpoint", "dischargeLimit"} & set(x) for x in periods or []):
             raise CitrineCompatibilityError(
                 f"OCPP {protocol.removeprefix('ocpp')} accepts charging-only periods (no setpoint or discharge)")
+        if price_schedule is not None:
+            prices = self.price_commands
+            if not prices.get("enabled") or protocol != PROTOCOL:
+                raise CitrineCompatibilityError(
+                    "A price schedule needs OCPP 2.1 and price commands enabled by the server")
+            limits = prices["price_schedule"]
+            if not valid_price_schedule(price_schedule, currency=prices["currency"],
+                                        max_rule_stacks=limits["max_rule_stacks"],
+                                        max_horizon_s=limits["max_horizon_s"]):
+                raise CitrineCompatibilityError("Price schedule outside the server's price policy")
         payload = build_profile(transaction_id, periods, duration=duration, profile_id=profile_id,
-                                stack_level=stack_level, start_at=start_at, immediate=immediate)
+                                stack_level=stack_level, start_at=start_at, immediate=immediate,
+                                price_schedule=price_schedule)
         return await self._dispatch("profile", payload, protocol=protocol, station_id=station_id)
+
+    async def cost_updated(self, *, protocol, station_id, body):
+        """CostUpdated (feature C) for the command station's active transaction."""
+        if not valid_cost_updated(body) or not transaction(body["transactionId"]):
+            raise CitrineCompatibilityError("CostUpdated outside the server's price policy")
+        return await self._dispatch("cost_update", body, protocol=protocol, station_id=station_id)
+
+    async def set_default_tariff(self, *, protocol, station_id, evse_id, tariff):
+        """SetDefaultTariff (feature D) to the command station or a listed tariff station."""
+        prices = self.price_commands
+        if (not integer(evse_id, 0, 2147483647) or not prices.get("enabled")
+                or not valid_tariff(tariff, currency=prices["currency"], limits=prices["tariff_limits"])):
+            raise CitrineCompatibilityError("Tariff outside the server's price policy")
+        return await self._dispatch("tariff", {"evseId": evse_id, "tariff": tariff},
+                                    protocol=protocol, station_id=station_id)
 
     async def set_charging_profile(self, *, protocol, station_id, limit, setpoint=None,
                                     discharge_limit=None, operation_mode=None, unit="W",
