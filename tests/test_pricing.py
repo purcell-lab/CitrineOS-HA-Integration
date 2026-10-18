@@ -15,7 +15,7 @@ from custom_components.citrine_ha.lab_entities import (
     SERVICE, SERVICE_COST, SERVICE_TARIFF, setup_lab)
 from custom_components.citrine_ha.pricing import (
     PriceInterval, amber_intervals, build_cost_updated, build_price_schedule, build_tariff,
-    contiguous, current_and_next, local_parts, price_text, rational, tariff_status,
+    contiguous, current_and_next, local_parts, openadr_forecasts, price_text, rational, tariff_status,
     valid_cost_updated, valid_price_schedule, valid_tariff)
 
 BNE = ZoneInfo("Australia/Brisbane")
@@ -485,11 +485,20 @@ def now_forecast(minutes=30, prices=(0.225, 0.202, -0.03), entity="sensor.amber_
     return SimpleNamespace(entity_id=entity, state=str(prices[0]), attributes={"detailedForecast": items}), start
 
 
-async def services(c, stations, states):
+async def services(c, stations, states, openadr=None):
     coordinator = MagicMock();coordinator.async_request_refresh = AsyncMock()
     coordinator.data = {"stations": stations};coordinator.last_update_success = True
     ctx = {"client": c, "coordinator": coordinator}
-    hass = MagicMock();hass.data = {"citrine_ha": {"entry": ctx}};hass.services.has_service.return_value = False
+    hass = MagicMock();hass.data = {"citrine_ha": {"entry": ctx}}
+    # openadr: {entity_id: get_forecast rows}; the openadr3_ven service exists only then.
+    hass.services.has_service.side_effect = lambda domain, name: openadr is not None and domain == "openadr3_ven"
+
+    async def get_forecast(domain, name, data, target=None, blocking=False, return_response=False):
+        assert (domain, name, blocking, return_response) == ("openadr3_ven", "get_forecast", True, True)
+        assert data["end"] - data["start"] == timedelta(hours=49)
+        eid = target["entity_id"]
+        return {eid: {"payload_type": "PRICE", "unit": "AUD/kWh", "forecast": openadr[eid]}}
+    hass.services.async_call = AsyncMock(side_effect=get_forecast)
     hass.config.time_zone = "Australia/Brisbane"
     hass.states.get.side_effect = states.get
     entry = MagicMock();entry.entry_id = "entry"
@@ -587,7 +596,7 @@ async def test_default_tariff_validation_errors():
         await call2(SERVICE_TARIFF, price_entity=state.entity_id)
     empty = SimpleNamespace(entity_id="sensor.empty", state="0.2", attributes={"forecasts": []})
     call = await services(c, [station()], {**states, "sensor.empty": empty})
-    with pytest.raises(ServiceValidationError, match="no current or future Amber price"):
+    with pytest.raises(ServiceValidationError, match="no current or future price interval"):
         await call(SERVICE_TARIFF, price_entity="sensor.empty")
     off = client(policy());await off.control_policy()
     call = await services(off, [station()], states)
@@ -626,3 +635,68 @@ async def test_lab_schedule_price_entity_attaches_absolute_price_schedule():
     with pytest.raises(ServiceValidationError, match="disabled"):
         await call(SERVICE, periods=periods, immediate=True, price_entity=state.entity_id)
     assert c201.posts == off.posts == []
+
+
+def vtn_rows(start, prices, first_minutes=5):
+    """openadr3_ven get_forecast rows: a 5-minute current interval, then 30-minute ones."""
+    rows, at = [], start
+    for i, price in enumerate(prices):
+        minutes = first_minutes if i == 0 else 30
+        rows.append({"datetime": at.astimezone(BNE).isoformat(), "value": price, "interval_minutes": minutes})
+        at += timedelta(minutes=minutes)
+    return rows
+
+
+def test_openadr_rows_become_intervals_current_first():
+    now = T0 + timedelta(minutes=2)
+    rows = vtn_rows(T0, [0.355155, 0.383078, -0.02])
+    rows.insert(0, {"datetime": (T0 - timedelta(minutes=30)).isoformat(), "value": 0.3, "interval_minutes": 30})
+    rows += [{"datetime": "bad", "value": 1, "interval_minutes": 30}, {"datetime": T0.isoformat(), "value": None,
+             "interval_minutes": 30}, {"datetime": T0.isoformat(), "value": 1, "interval_minutes": 0}, "row"]
+    state = SimpleNamespace(entity_id="sensor.x", state="0.355155", attributes={"forecasts": openadr_forecasts(rows)})
+    got = amber_intervals(state, now)
+    assert [(i.start, i.end, i.price) for i in got] == [
+        (T0, T0 + timedelta(minutes=5), 0.355155),
+        (T0 + timedelta(minutes=5), T0 + timedelta(minutes=35), 0.383078),
+        (T0 + timedelta(minutes=35), T0 + timedelta(minutes=65), -0.02)]
+    current, nxt = current_and_next(got, now)
+    assert current.price == 0.355155 and nxt.price == 0.383078
+    assert openadr_forecasts(None) == openadr_forecasts("x") == []
+
+
+@pytest.mark.asyncio
+async def test_openadr_ven_sensor_feeds_cost_update_and_tariff():
+    c = client();await c.control_policy()
+    now = datetime.now(UTC)
+    start = now.replace(second=0, microsecond=0) - timedelta(minutes=now.minute % 5)
+    imp, exp = "sensor.openadr3_vtn_au_qld1_price", "sensor.openadr3_vtn_au_qld1_export_price"
+    attrs = {"payload_type": "PRICE", "unit_of_measurement": "AUD/kWh", "forecast_rows": 3}
+    states = {imp: SimpleNamespace(entity_id=imp, state="0.355155", attributes=attrs),
+              exp: SimpleNamespace(entity_id=exp, state="0.216571", attributes={**attrs, "payload_type": "EXPORT_PRICE"})}
+    call = await services(c, [station()], states,
+                          openadr={imp: vtn_rows(start, [0.355155, 0.383078, 0.390571]),
+                                   exp: vtn_rows(start, [0.216571, 0.239819, 0.25])})
+    out = await call(SERVICE_COST, price_entity=imp)
+    body = c.posts[-1][2]
+    assert body["customData"]["chargingPrice"] == {"kWhPrice": 0.35516}
+    assert body["customData"]["nextPeriod"]["chargingPrice"] == {"kWhPrice": 0.38308}
+    assert body["customData"]["priceText"].startswith("OpenADR 35.5 c/kWh now, 38.3 c/kWh from ")
+    assert out["sent"]["price_text"] == body["customData"]["priceText"]
+    await call(SERVICE_TARIFF, price_entity=imp, export_price_entity=exp, intervals=3)
+    tariff = c.posts[-1][2]["tariff"]
+    assert tariff["tariffId"].startswith("openadr-")
+    assert tariff["description"][0]["content"].startswith("OpenADR forecast, 3 intervals")
+    prices = tariff["energy"]["prices"]
+    assert prices[0]["priceKwh"] == round(0.355155 / 1.1, 5)
+    assert any(p["priceKwh"] == -round(0.216571 / 1.1, 5) for p in prices)
+
+
+@pytest.mark.asyncio
+async def test_openadr_forecast_without_rows_is_a_clear_error():
+    c = client();await c.control_policy()
+    imp = "sensor.openadr3_vtn_au_qld1_price"
+    states = {imp: SimpleNamespace(entity_id=imp, state="0.3", attributes={"payload_type": "PRICE"})}
+    call = await services(c, [station()], states, openadr={imp: []})
+    with pytest.raises(ServiceValidationError, match="no current or future price interval"):
+        await call(SERVICE_COST, price_entity=imp)
+    assert c.posts == []

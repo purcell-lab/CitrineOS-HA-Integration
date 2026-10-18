@@ -1,5 +1,6 @@
 """Small, explicit manual control surface for the single enrolled command station."""
-from datetime import UTC
+from datetime import UTC, timedelta
+from types import SimpleNamespace
 
 import voluptuous as vol
 from homeassistant.components.button import ButtonEntity
@@ -16,7 +17,8 @@ from .citrine_api import CitrineApiError
 from .lab_control import (PROFILE_ID, PROTOCOL, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient,
                           power_period, number)
 from .pricing import (TOTAL_COST_MAX, amber_intervals, build_cost_updated, build_price_schedule,
-                      build_tariff, current_and_next, schedule_summary, tariff_summary)
+                      build_tariff, current_and_next, openadr_forecasts, schedule_summary,
+                      tariff_summary)
 
 SERVICE = "lab_schedule"
 SERVICE_RECONCILE = "lab_reconcile"
@@ -33,20 +35,47 @@ def time_zone(hass):
     return dt_util.get_time_zone(hass.config.time_zone) or UTC
 
 
-def price_state(hass, entity_id):
-    """The HA state of a price sensor; Amber forecast attributes are parsed later."""
+OPENADR_DOMAIN = "openadr3_ven"
+OPENADR_HORIZON = timedelta(hours=48)
+
+
+async def price_state(hass, entity_id):
+    """A price sensor as a State-like object with Amber-shaped forecast attributes.
+
+    Amber sensors carry their forecast in attributes. OpenADR 3 VEN sensors (the
+    openadr3_ven integration) return theirs from its get_forecast service instead, so
+    the next 48 h are fetched and converted; the builders treat both alike.
+    """
     state = hass.states.get(entity_id)
     if state is None:
         raise ServiceValidationError(f"Price entity {entity_id} not found")
-    return state
+    if ("payload_type" not in (state.attributes or {})
+            or not hass.services.has_service(OPENADR_DOMAIN, "get_forecast")):
+        return state
+    now = dt_util.utcnow()
+    try:
+        response = await hass.services.async_call(
+            OPENADR_DOMAIN, "get_forecast",
+            {"start": now - timedelta(hours=1), "end": now + OPENADR_HORIZON},
+            target={"entity_id": entity_id}, blocking=True, return_response=True)
+    except HomeAssistantError as err:
+        raise ServiceValidationError(f"OpenADR forecast for {entity_id} unavailable: {err}") from err
+    rows = ((response or {}).get(entity_id) or {}).get("forecast")
+    return SimpleNamespace(entity_id=entity_id, state=state.state, source="OpenADR",
+                           attributes={**state.attributes, "forecasts": openadr_forecasts(rows)})
+
+
+def source(state):
+    """The label shown with the price: "OpenADR" for VEN sensors, else "Amber"."""
+    return getattr(state, "source", "Amber")
 
 
 def forecast(state):
     intervals = amber_intervals(state)
     if not intervals:
         raise ServiceValidationError(
-            f"{state.entity_id} has no current or future Amber price interval "
-            "(attributes forecasts[] or detailedForecast[] with per_kwh, start_time, end_time)")
+            f"{state.entity_id} has no current or future price interval (an OpenADR 3 VEN "
+            "price sensor, or Amber attributes forecasts[] or detailedForecast[])")
     return intervals
 
 
@@ -119,7 +148,8 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False, p
                 limits = prices["price_schedule"]
                 schedule = build_price_schedule(
                     forecast(price), currency=prices["currency"],
-                    max_rule_stacks=limits["max_rule_stacks"], max_horizon_s=limits["max_horizon_s"])
+                    max_rule_stacks=limits["max_rule_stacks"], max_horizon_s=limits["max_horizon_s"],
+                    label=source(price))
                 sent = {"price_schedule": schedule_summary(schedule)}
             await client.submit_schedule(
                 protocol=protocol, station_id=sid, transaction_id=tx,
@@ -154,7 +184,7 @@ async def cost_update(ctx, state, *, total_cost=0, tz=UTC):
             raise ServiceValidationError(
                 f"{state.entity_id} has no price for the current interval (the core Amber forecast "
                 "sensor lists future intervals only: use its price sensor or amber_express)")
-        body = build_cost_updated(tx, current, nxt, tz, total_cost=total_cost)
+        body = build_cost_updated(tx, current, nxt, tz, total_cost=total_cost, label=source(state))
         await client.cost_updated(protocol=protocol, station_id=sid, body=body)
     except CitrineApiError as err:
         raise HomeAssistantError(str(err)) from err
@@ -186,7 +216,7 @@ async def default_tariff(ctx, state, *, export_state=None, station_id=None, evse
             raise HomeAssistantError(f"Fresh online evidence is required for {sid}")
         if protocol != PROTOCOL:
             raise ServiceValidationError(f"SetDefaultTariff needs OCPP 2.1; {sid} is on {protocol}")
-        tariff = build_tariff(forecast(state), tz,
+        tariff = build_tariff(forecast(state), tz, label=source(state),
                               export_intervals=forecast(export_state) if export_state is not None else (),
                               count=intervals, currency=prices["currency"], limits=prices["tariff_limits"])
         await client.set_default_tariff(protocol=protocol, station_id=sid, evse_id=evse_id, tariff=tariff)
@@ -337,7 +367,7 @@ async def setup_lab(hass, entry, add_entities, platform):
                 return await command(
                     target(call), "schedule", periods=call.data["periods"], duration=call.data["duration"],
                     immediate=call.data["immediate"],
-                    price=price_state(hass, price) if price else None)
+                    price=await price_state(hass, price) if price else None)
             hass.services.async_register(DOMAIN, SERVICE, submit, schema=vol.Schema({
                 vol.Required("entry_id"): str,
                 vol.Required("periods"): [dict],
@@ -348,7 +378,7 @@ async def setup_lab(hass, entry, add_entities, platform):
         if not hass.services.has_service(DOMAIN, SERVICE_COST):
             async def submit_cost(call):
                 ctx = target(call)
-                return await cost_update(ctx, price_state(hass, call.data["price_entity"]),
+                return await cost_update(ctx, await price_state(hass, call.data["price_entity"]),
                                          total_cost=call.data["total_cost"], tz=time_zone(hass))
             hass.services.async_register(DOMAIN, SERVICE_COST, submit_cost, schema=vol.Schema({
                 vol.Required("entry_id"): str,
@@ -361,8 +391,8 @@ async def setup_lab(hass, entry, add_entities, platform):
                 ctx = target(call)
                 export = call.data.get("export_price_entity")
                 return await default_tariff(
-                    ctx, price_state(hass, call.data["price_entity"]),
-                    export_state=price_state(hass, export) if export else None,
+                    ctx, await price_state(hass, call.data["price_entity"]),
+                    export_state=await price_state(hass, export) if export else None,
                     station_id=call.data.get("station_id"), evse_id=call.data["evse_id"],
                     intervals=call.data["intervals"], tz=time_zone(hass))
             hass.services.async_register(DOMAIN, SERVICE_TARIFF, submit_tariff, schema=vol.Schema({

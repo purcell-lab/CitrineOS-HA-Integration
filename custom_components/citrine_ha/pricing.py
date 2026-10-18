@@ -79,6 +79,27 @@ def _interval(item, price=None):
     return PriceInterval(start, end, float(price))
 
 
+def openadr_forecasts(rows):
+    """openadr3_ven get_forecast rows as Amber-shaped forecast items.
+
+    Rows are {"datetime", "value" (AUD/kWh incl. GST), "interval_minutes"}, as returned by
+    the openadr3_ven integration's get_forecast service at the VTN's native granularity.
+    Unusable rows are dropped; amber_intervals() then applies the usual rules.
+    """
+    items = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        start = _utc(row.get("datetime"))
+        minutes = row.get("interval_minutes")
+        if start is None or not _finite(row.get("value")) or not _finite(minutes) or minutes <= 0:
+            continue
+        items.append({"per_kwh": float(row["value"]), "start_time": start.isoformat(),
+                      "end_time": (start + timedelta(minutes=minutes)).isoformat(),
+                      "duration": minutes})
+    return items
+
+
 def _state_price(state):
     """The entity state as AUD/kWh (amber_express reports the current price there)."""
     try:
@@ -170,7 +191,8 @@ def contiguous(intervals):
 
 # B: absolutePriceSchedule
 
-def build_price_schedule(intervals, *, currency=CURRENCY, max_rule_stacks=288, max_horizon_s=172800):
+def build_price_schedule(intervals, *, currency=CURRENCY, max_rule_stacks=288, max_horizon_s=172800,
+                         label="Amber"):
     """An absolutePriceSchedule from the contiguous intervals, current one first.
 
     One rule stack per Amber interval (5-minute intervals are kept as is), up
@@ -195,7 +217,7 @@ def build_price_schedule(intervals, *, currency=CURRENCY, max_rule_stacks=288, m
         "priceScheduleID": int(anchor.timestamp() // 60) % 2147483647,
         "currency": currency, "language": "en", "priceAlgorithm": PRICE_ALGORITHM,
         "priceRuleStacks": stacks,
-        "priceScheduleDescription": f"Amber import forecast, {currency}/kWh incl. GST",
+        "priceScheduleDescription": f"{label} import forecast, {currency}/kWh incl. GST",
     }
 
 
@@ -247,15 +269,15 @@ def cents(price):
     return f"{_round(price * 100, 1):.1f} c/kWh"
 
 
-def price_text(current, nxt, tz):
+def price_text(current, nxt, tz, label="Amber"):
     """E.g. "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" (local time)."""
-    text = f"Amber {cents(current.price)} now"
+    text = f"{label} {cents(current.price)} now"
     if nxt is not None:
         text += f", {cents(nxt.price)} from {nxt.start.astimezone(tz):%H:%M}"
     return text[:255]
 
 
-def build_cost_updated(transaction_id, current, nxt, tz, *, total_cost=0):
+def build_cost_updated(transaction_id, current, nxt, tz, *, total_cost=0, label="Amber"):
     """The CostUpdated body: current price, the next interval and a price text.
 
     kWhPrice is AUD/kWh incl. GST at 5 dp, clamped to -5..20; the text keeps
@@ -270,7 +292,7 @@ def build_cost_updated(transaction_id, current, nxt, tz, *, total_cost=0):
     custom = {"vendorId": COST_VENDOR, "chargingPrice": kwh(current.price)}
     if nxt is not None:
         custom["nextPeriod"] = {"atTime": iso(current.end), "chargingPrice": kwh(nxt.price)}
-    custom["priceText"] = price_text(current, nxt, tz)
+    custom["priceText"] = price_text(current, nxt, tz, label)
     return {"totalCost": total_cost, "transactionId": transaction_id, "customData": custom}
 
 
@@ -333,7 +355,8 @@ def _entries(intervals, tz, limits, *, export=False):
     return entries
 
 
-def build_tariff(intervals, tz, *, export_intervals=(), count=48, currency=CURRENCY, limits=None):
+def build_tariff(intervals, tz, *, export_intervals=(), count=48, currency=CURRENCY, limits=None,
+                 label="Amber"):
     """A TariffType: Amber import (and optional feed-in) intervals as energy prices.
 
     priceKwh is AUD/kWh excl. GST (Amber ÷ 1.1, 5 dp) with taxRates GST 10.
@@ -355,9 +378,9 @@ def build_tariff(intervals, tz, *, export_intervals=(), count=48, currency=CURRE
     first = intervals[0].start
     local = first.astimezone(tz)
     used = intervals[:count]
-    description = (f"Amber forecast, {len(used)} intervals from {local:%Y-%m-%d %H:%M}"
+    description = (f"{label} forecast, {len(used)} intervals from {local:%Y-%m-%d %H:%M}"
                    f"{' with feed-in' if exports else ''} ({currency}/kWh excl. GST, GST 10 %)")
-    return {"tariffId": f"amber-{local:%Y%m%d-%H%M}", "currency": currency,
+    return {"tariffId": f"{label.lower()}-{local:%Y%m%d-%H%M}", "currency": currency,
             "description": [{"format": "UTF8", "language": "en", "content": description[:255]}],
             "validFrom": iso(first),
             "energy": {"prices": prices, "taxRates": [{"type": "GST", "tax": 10}]}}

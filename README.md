@@ -100,7 +100,14 @@ works as before.
 | `citrine_ha.lab_cost_update` | `CostUpdated` with California Pricing `customData`: current price, the next interval as `nextPeriod`, and text such as "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" | command station, OCPP 2.1 or 2.0.1, active transaction |
 | `citrine_ha.lab_default_tariff` | `SetDefaultTariff`: Amber intervals as `energy.prices[]` with local start/end time of day and dates, priceKwh = Amber ÷ 1.1 (5 dp), GST 10 %; an optional feed-in sensor adds export entries (`minPower: -1, maxPower: -1000000`, priceKwh = −feed-in ÷ 1.1) | a station in `tariff_stations` (default the command station), OCPP 2.1 |
 
-Price sensors: the core `amberelectric` forecast sensors (`forecasts[]`) and
+**OpenADR 3 VEN sensors (preferred).** A price sensor from the `openadr3_ven`
+integration (for example `sensor.openadr3_vtn_..._price` and `..._export_price`,
+`payload_type` PRICE / EXPORT_PRICE) is read through its `openadr3_ven.get_forecast`
+service: the next 48 h at the VTN's native granularity (5- then 30-minute intervals).
+Values are AUD/kWh including GST. The price text, price schedule description and
+tariff ID then say "OpenADR" (`openadr-YYYYMMDD-HHMM`).
+
+Amber sensors: the core `amberelectric` forecast sensors (`forecasts[]`) and
 price sensors (one current interval), and `amber_express`
 (`detailedForecast[]`, current price in the state). Past intervals and
 intervals with no price are skipped; negative prices are kept. The core
@@ -122,22 +129,22 @@ station outside `tariff_stations` fail with a validation error before
 anything is sent.
 
 ```yaml
-alias: CitrineOS lab - Amber prices to the station
+alias: CitrineOS lab - OpenADR prices to the station
 mode: queued
 triggers:
   - trigger: state
-    entity_id: sensor.home_general_price
+    entity_id: sensor.openadr3_vtn_example_price
 actions:
   - action: citrine_ha.lab_cost_update
     continue_on_error: true   # no active transaction is a validation error
     data:
       entry_id: "<the isolated CitrineOS entry ID>"
-      price_entity: sensor.home_general_price
+      price_entity: sensor.openadr3_vtn_example_price
   - action: citrine_ha.lab_default_tariff
     data:
       entry_id: "<the isolated CitrineOS entry ID>"
-      price_entity: sensor.home_general_forecast
-      export_price_entity: sensor.home_feed_in_forecast
+      price_entity: sensor.openadr3_vtn_example_price
+      export_price_entity: sensor.openadr3_vtn_example_export_price
       intervals: 48
     response_variable: tariff
   - action: system_log.write
@@ -153,7 +160,7 @@ data:
   entry_id: "<the isolated CitrineOS entry ID>"
   immediate: true
   duration: 240
-  price_entity: sensor.home_general_forecast
+  price_entity: sensor.openadr3_vtn_example_price
   periods:
     - {startPeriod: 0, limit: 11000, dischargeLimit: -11000, setpoint: 6000, operationMode: CentralSetpoint}
 response_variable: schedule   # schedule.sent.price_schedule: id, rule stacks, horizon
