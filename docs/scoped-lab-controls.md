@@ -76,6 +76,10 @@ transaction ID is looked up, not selected by the user. There is no automatic
 change of units, profile purpose, protocol or transaction-ID representation.
 Use these scoped controls, not inherited legacy convenience services.
 
+Price information (OCPP 2.1 absolutePriceSchedule, CostUpdated,
+SetDefaultTariff) from Amber Electric sensors: see "Dynamic pricing" in the
+README. It needs the App's `price_commands` policy and never changes power.
+
 ## Honest outcomes and stop behaviour
 
 A successful HTTP/native API result is labelled
