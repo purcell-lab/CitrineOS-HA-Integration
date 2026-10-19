@@ -96,14 +96,14 @@ works as before.
 
 | Service | Message | Stations |
 | --- | --- | --- |
-| `citrine_ha.lab_schedule` + `price_entity` | TxProfile with `absolutePriceSchedule` (one rule stack per Amber interval, current first, up to `max_rule_stacks` and 48 h) | command station, OCPP 2.1 |
+| `citrine_ha.lab_schedule` + `price_entity` | TxProfile with `absolutePriceSchedule` (one rule stack per Amber interval, current first, up to `max_rule_stacks` and the next 24 h) | command station, OCPP 2.1 |
 | `citrine_ha.lab_cost_update` | `CostUpdated` with California Pricing `customData`: current price, the next interval as `nextPeriod`, and text such as "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" | command station, OCPP 2.1 or 2.0.1, active transaction |
 | `citrine_ha.lab_default_tariff` | `SetDefaultTariff`: Amber intervals as `energy.prices[]` with local start/end time of day and dates, priceKwh = Amber ÷ 1.1 (5 dp), GST 10 %; an optional feed-in sensor adds export entries (`minPower: -1, maxPower: -1000000`, priceKwh = −feed-in ÷ 1.1) | a station in `tariff_stations` (default the command station), OCPP 2.1 |
 
 **OpenADR 3 VEN sensors (preferred).** A price sensor from the `openadr3_ven`
 integration (for example `sensor.openadr3_vtn_..._price` and `..._export_price`,
 `payload_type` PRICE / EXPORT_PRICE) is read through its `openadr3_ven.get_forecast`
-service: the next 48 h at the VTN's native granularity (5- then 30-minute intervals).
+service: the next 24 h at the VTN's native granularity (5- then 30-minute intervals).
 Values are AUD/kWh including GST. The price text, price schedule description and
 tariff ID then say "OpenADR" (`openadr-YYYYMMDD-HHMM`).
 

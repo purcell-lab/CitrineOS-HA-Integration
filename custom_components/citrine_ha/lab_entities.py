@@ -36,7 +36,10 @@ def time_zone(hass):
 
 
 OPENADR_DOMAIN = "openadr3_ven"
-OPENADR_HORIZON = timedelta(hours=48)
+# Prices sent to a station cover the next 24 h: the price schedule in a charging
+# profile (a 48 h one made the profile over 13 KiB) and the OpenADR forecast read.
+PRICE_HORIZON = timedelta(hours=24)
+OPENADR_HORIZON = PRICE_HORIZON
 
 
 async def price_state(hass, entity_id):
@@ -44,7 +47,7 @@ async def price_state(hass, entity_id):
 
     Amber sensors carry their forecast in attributes. OpenADR 3 VEN sensors (the
     openadr3_ven integration) return theirs from its get_forecast service instead, so
-    the next 48 h are fetched and converted; the builders treat both alike.
+    the next 24 h are fetched and converted; the builders treat both alike.
     """
     state = hass.states.get(entity_id)
     if state is None:
@@ -148,7 +151,8 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False, p
                 limits = prices["price_schedule"]
                 schedule = build_price_schedule(
                     forecast(price), currency=prices["currency"],
-                    max_rule_stacks=limits["max_rule_stacks"], max_horizon_s=limits["max_horizon_s"],
+                    max_rule_stacks=limits["max_rule_stacks"],
+                    max_horizon_s=min(limits["max_horizon_s"], int(PRICE_HORIZON.total_seconds())),
                     label=source(price))
                 sent = {"price_schedule": schedule_summary(schedule)}
             await client.submit_schedule(
