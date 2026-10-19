@@ -81,7 +81,62 @@
           "mqtt_topic_prefix": "MQTT Intent Topic Prefix (e.g. citrine/ems)",
           "scan_interval": "Discovery Scan Interval (seconds)",
           "default_id_tag": "Default ID Tag",
-          "default_evse_id": "Default EVSE ID"
+          "default_evse_id": "Default EVSE ID",
+          "default_max_power_w": "Fallback max charge/discharge power (W) when CitrineOS reports no EV limit or EVSE rating"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "max_discharge_power": {
+        "name": "Max discharge power",
+        "state_attributes": {
+          "source": {
+            "name": "Source",
+            "state": {
+              "ev_charging_needs": "EV charging needs",
+              "evse_rating": "EVSE rating",
+              "fallback": "Fallback option"
+            }
+          },
+          "ev_limit_w": {
+            "name": "EV limit (W)"
+          },
+          "evse_rating_w": {
+            "name": "EVSE rating (W)"
+          },
+          "fallback_w": {
+            "name": "Fallback (W)"
+          },
+          "transaction_id": {
+            "name": "Transaction ID"
+          }
+        }
+      },
+      "max_charge_power": {
+        "name": "Max charge power",
+        "state_attributes": {
+          "source": {
+            "name": "Source",
+            "state": {
+              "ev_charging_needs": "EV charging needs",
+              "evse_rating": "EVSE rating",
+              "fallback": "Fallback option"
+            }
+          },
+          "ev_limit_w": {
+            "name": "EV limit (W)"
+          },
+          "evse_rating_w": {
+            "name": "EVSE rating (W)"
+          },
+          "fallback_w": {
+            "name": "Fallback (W)"
+          },
+          "transaction_id": {
+            "name": "Transaction ID"
+          }
         }
       }
     }

@@ -28,6 +28,7 @@ from .const import (
     CONF_DEADBAND_W,
     CONF_DEFAULT_EVSE_ID,
     CONF_DEFAULT_ID_TAG,
+    CONF_DEFAULT_MAX_POWER_W,
     CONF_DOE_EXPORT_LIMIT_SENSOR,
     CONF_DOE_IMPORT_LIMIT_SENSOR,
     CONF_EMS_ENDPOINT_PREFIX,
@@ -67,6 +68,9 @@ from .const import (
     DEFAULT_DEADBAND_W,
     DEFAULT_DEFAULT_EVSE_ID,
     DEFAULT_DEFAULT_ID_TAG,
+    DEFAULT_MAX_POWER_W,
+    MAX_MAX_POWER_W,
+    MIN_MAX_POWER_W,
     DEFAULT_EMS_ENDPOINT_PREFIX,
     DEFAULT_EMS_TELEMETRY_LIMIT,
     DEFAULT_EMS_TELEMETRY_STALE_SECS,
@@ -384,6 +388,18 @@ class CitrineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return CitrineOptionsFlow(config_entry)
 
 
+def _max_power_field(values: dict[str, Any]) -> dict[Any, Any]:
+    """Fallback for the max charge/discharge power sensors (W)."""
+    try:
+        default = int(float(values.get(CONF_DEFAULT_MAX_POWER_W, DEFAULT_MAX_POWER_W)))
+    except (TypeError, ValueError):
+        default = DEFAULT_MAX_POWER_W
+    default = min(max(default, MIN_MAX_POWER_W), MAX_MAX_POWER_W)
+    return {vol.Optional(CONF_DEFAULT_MAX_POWER_W, default=default): selector.NumberSelector(
+        selector.NumberSelectorConfig(min=MIN_MAX_POWER_W, max=MAX_MAX_POWER_W, step=100,
+                                      unit_of_measurement="W", mode=selector.NumberSelectorMode.BOX))}
+
+
 class CitrineOptionsFlow(config_entries.OptionsFlow):
     """Handle Citrine options flow."""
 
@@ -400,6 +416,7 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
                 vol.Optional(CONF_SCAN_INTERVAL, default=values.get(CONF_SCAN_INTERVAL, 10)):
                     selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=60, step=1)),
+                **_max_power_field(values),
             })
         schema: dict[Any, Any] = {}
         schema[vol.Required(CONF_READ_ONLY, default=is_read_only(values))] = selector.BooleanSelector()
@@ -557,6 +574,7 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
         )] = selector.NumberSelector(
             selector.NumberSelectorConfig(min=0, max=999, step=1, mode=selector.NumberSelectorMode.BOX)
         )
+        schema.update(_max_power_field(values))
 
         return vol.Schema(schema)
 

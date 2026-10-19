@@ -6,7 +6,8 @@ import voluptuous as vol
 from homeassistant.components.button import ButtonEntity
 from homeassistant.core import SupportsResponse
 from homeassistant.components.number import NumberEntity
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
+from homeassistant.const import UnitOfPower
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -16,6 +17,7 @@ from .const import DOMAIN
 from .citrine_api import CitrineApiError
 from .lab_control import (PROFILE_ID, PROTOCOL, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient,
                           power_period, number)
+from .power_limits import CHARGE, DISCHARGE, sensor_state
 from .pricing import (TOTAL_COST_MAX, amber_intervals, build_cost_updated, build_price_schedule,
                       build_tariff, current_and_next, openadr_forecasts, schedule_summary,
                       tariff_summary)
@@ -254,10 +256,11 @@ async def reconcile(ctx):
 class LabEntity(CoordinatorEntity):
     _attr_has_entity_name = True
 
-    def __init__(self, ctx, entry, key, name):
+    def __init__(self, ctx, entry, key, name, sid=None):
         super().__init__(ctx["coordinator"])
         self.ctx = ctx
-        sid = ctx["client"].station
+        command_station = sid is None or sid == ctx["client"].station
+        sid = sid or ctx["client"].station
         self._station_id = sid
         self._attr_unique_id = f"{entry.entry_id}_{sid}_lab_{key}"
         self._attr_name = name
@@ -265,7 +268,8 @@ class LabEntity(CoordinatorEntity):
         self._attr_device_info = {
             "identifiers": {(DOMAIN, f"1:{sid}")},
             "name": f"CitrineOS EVerest V2G lab {sid}" if simulator else f"CitrineOS lab {sid}",
-            "model": "Isolated simulator" if simulator else "Physical charger (lab command station)",
+            "model": ("Isolated simulator" if simulator else "Physical charger (lab command station)"
+                      if command_station else "Physical charger (read only)"),
             **({"manufacturer": "EVerest"} if simulator else {}),
         }
 
@@ -351,6 +355,47 @@ class LabSensor(LabEntity, SensorEntity):
                 if k not in ("power_w", "import_kwh", "export_kwh")}
 
 
+class LabMaxPowerSensor(LabEntity, SensorEntity):
+    """Usable charge or discharge power of any discovered station (read only)."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+
+    def __init__(self, ctx, entry, sid, direction):
+        super().__init__(ctx, entry, f"max_{direction}_power", f"Max {direction} power", sid)
+        self.direction = direction
+        self._attr_translation_key = f"max_{direction}_power"
+        self._attr_icon = "mdi:transmission-tower-export" if direction == DISCHARGE else "mdi:ev-plug-ccs2"
+
+    @property
+    def available(self):
+        # A cap, not a measurement: keep the fallback while the station is offline.
+        return CoordinatorEntity.available.fget(self)
+
+    @property
+    def native_value(self):
+        return sensor_state(station(self.coordinator.data, self._station_id), self.direction,
+                            self.coordinator.default_max_power_w)[0]
+
+    @property
+    def extra_state_attributes(self):
+        return sensor_state(station(self.coordinator.data, self._station_id), self.direction,
+                            self.coordinator.default_max_power_w)[1]
+
+
+def max_power_sensors(ctx, entry, known):
+    """Max discharge and charge power sensors for stations not yet known."""
+    entities = []
+    for s in (ctx["coordinator"].data or {}).get("stations", []):
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid or sid in known:
+            continue
+        known.add(sid)
+        entities += [LabMaxPowerSensor(ctx, entry, sid, DISCHARGE), LabMaxPowerSensor(ctx, entry, sid, CHARGE)]
+    return entities
+
+
 async def setup_lab(hass, entry, add_entities, platform):
     ctx = hass.data[DOMAIN][entry.entry_id]
     if platform == "button":
@@ -426,3 +471,12 @@ async def setup_lab(hass, entry, add_entities, platform):
             ("status", "Connector status", None),
             ("command", "Command dispatch status", None),
         )])
+        # Every discovered station, not only the command station.
+        known = set()
+        add_entities(max_power_sensors(ctx, entry, known))
+
+        def add_new():
+            new = max_power_sensors(ctx, entry, known)
+            if new:
+                add_entities(new)
+        entry.async_on_unload(ctx["coordinator"].async_add_listener(add_new))
