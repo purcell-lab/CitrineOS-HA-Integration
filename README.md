@@ -193,11 +193,13 @@ The value is the smallest of the sources CitrineOS has, else the fallback:
    current × `evMaxVoltage`. `energyAmount`, SoC and departure time are ignored.
    A row without a transaction link counts when it is on the transaction's
    EVSE and newer than the transaction start.
-2. `evse_rating`: device model variable `Power` of component `EVSE` (the
-   largest EVSE), else `ChargingStation`: `VariableCharacteristics.maxLimit`,
-   else the `MaxSet` attribute value. Discharge uses a discharge-specific
-   variable when the station reports one (`DischargePower`, `MaxDischargePower`,
-   ...), else a negative `Power` minLimit, else the charge rating.
+2. `evse_rating` / `evse_max_limit_shared`: device model variable `Power` of
+   component `EVSE` (the largest EVSE), else `ChargingStation`. The station's
+   own `MaxSet` attribute value wins (`evse_rating`); only when the station has
+   none is `VariableCharacteristics.maxLimit` used (`evse_max_limit_shared`).
+   Discharge, in order: a discharge-specific `MaxSet` (`DischargePower`,
+   `MaxDischargePower`, ...), its maxLimit, a negative `Power` minLimit, then
+   the charge rating.
 3. `fallback`: the option *Fallback max charge/discharge power* (default
    25,000 W, 1,000 to 350,000 W). OCPP 1.6 stations always use it.
 
@@ -215,8 +217,10 @@ each table is logged as a warning, repeats at debug, and the table is retried
 every 10 minutes. A timeout keeps the previous values until the next poll.
 
 CitrineOS keeps one `VariableCharacteristics` row per variable name and
-tenant, so a `Power` maxLimit is the last value any station reported; the
-per-station `MaxSet` attribute is used only when no maxLimit is stored.
+tenant, so a `Power` maxLimit (and minLimit) is the last value any station
+reported, not this station's. At a mixed-charger event the per-station
+`MaxSet` is therefore preferred, and `source: evse_max_limit_shared` marks a
+value taken from the shared characteristic.
 
 ---
 

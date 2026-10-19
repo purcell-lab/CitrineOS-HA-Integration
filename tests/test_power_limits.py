@@ -86,17 +86,18 @@ async def test_ev_limit_wins_when_smaller():
 async def test_evse_rating_wins_when_ev_limit_is_larger():
     hasura = FakeHasura(needs=[needs(dc={"evMaxPower": 150000, "evMaxDischargePower": 50000})])
     limits = await attach(hasura)
-    assert limits["charge"]["value"] == 22000 and limits["charge"]["source"] == "evse_rating"
+    assert limits["charge"]["value"] == 22000 and limits["charge"]["source"] == "evse_max_limit_shared"
     assert limits["discharge"]["ev_limit_w"] == 50000 and limits["discharge"]["value"] == 22000
 
 
 @pytest.mark.asyncio
 async def test_evse_max_limit_used_when_no_session():
+    # No MaxSet for the station: the shared maxLimit, labelled as shared.
     hasura = FakeHasura()
     limits = await attach(hasura, discovery(tx=False))
     for direction in ("charge", "discharge"):
         assert limits[direction]["value"] == 22000
-        assert limits[direction]["source"] == "evse_rating"
+        assert limits[direction]["source"] == "evse_max_limit_shared"
         assert limits[direction]["ev_limit_w"] is None
         assert limits[direction]["transaction_id"] is None
     assert "ChargingNeeds" not in [c[0] for c in hasura.calls]
@@ -117,7 +118,32 @@ async def test_max_set_attribute_when_characteristics_are_refused():
                         attributes=[{"id": 5, "stationId": 7, "componentId": 3, "variableId": 1,
                                      "type": "MaxSet", "value": "7400"}])
     limits = await attach(hasura, discovery(tx=False))
-    assert limits["charge"]["evse_rating_w"] == 7400
+    assert limits["charge"]["evse_rating_w"] == 7400 and limits["charge"]["source"] == "evse_rating"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_set", ["7400", "50000"])
+async def test_station_max_set_wins_over_shared_max_limit(max_set):
+    # maxLimit is one row per variable and tenant: the station's MaxSet wins, smaller or larger.
+    hasura = FakeHasura(attributes=[{"id": 5, "stationId": 7, "componentId": 3, "variableId": 1,
+                                     "type": "MaxSet", "value": max_set}])
+    limits = await attach(hasura, discovery(tx=False))
+    for direction in ("charge", "discharge"):
+        assert limits[direction]["evse_rating_w"] == int(max_set)
+        assert limits[direction]["source"] == "evse_rating"
+
+
+@pytest.mark.asyncio
+async def test_mixed_stations_keep_their_own_max_set():
+    data = discovery(tx=False)
+    data["stations"].append({**data["stations"][0], "id": "SIM-EV-OTHER", "databaseId": 8})
+    hasura = FakeHasura(attributes=[
+        {"id": 5, "stationId": 7, "componentId": 3, "variableId": 1, "type": "MaxSet", "value": "7400"},
+        {"id": 6, "stationId": 8, "componentId": 3, "variableId": 1, "type": "Actual", "value": "0"}])
+    await PowerLimitReader(hasura).async_attach(data, 25000)
+    first, second = (s["power_limits"]["charge"] for s in data["stations"])
+    assert (first["value"], first["source"]) == (7400, "evse_rating")
+    assert (second["value"], second["source"]) == (22000, "evse_max_limit_shared")
 
 
 @pytest.mark.asyncio
@@ -127,12 +153,42 @@ async def test_discharge_specific_rating_and_negative_min_limit():
     hasura.tables["VariableAttributes"].append(
         {"id": 6, "stationId": 7, "componentId": 3, "variableId": 2, "type": "MaxSet", "value": "10000"})
     limits = await attach(hasura, discovery(tx=False))
-    assert limits["charge"]["value"] == 22000 and limits["discharge"]["value"] == 10000
+    assert (limits["charge"]["value"], limits["charge"]["source"]) == (22000, "evse_max_limit_shared")
+    assert (limits["discharge"]["value"], limits["discharge"]["source"]) == (10000, "evse_rating")
 
     hasura = FakeHasura(characteristics=[{"id": 9, "variableId": 1, "maxLimit": 22000,
                                           "minLimit": -15000, "unit": "W"}])
     limits = await attach(hasura, discovery(tx=False))
     assert limits["discharge"]["evse_rating_w"] == 15000
+    assert limits["discharge"]["source"] == "evse_max_limit_shared"
+
+
+@pytest.mark.asyncio
+async def test_discharge_rating_order():
+    def reader(discharge_type, discharge_value, characteristic_max):
+        hasura = FakeHasura(characteristics=[
+            {"id": 9, "variableId": 1, "maxLimit": 22000, "minLimit": -15000, "unit": "W"},
+            {"id": 10, "variableId": 2, "maxLimit": characteristic_max, "unit": "W"}])
+        hasura.tables["Variables"].append({"id": 2, "name": "DischargePower", "instance": None})
+        hasura.tables["VariableAttributes"] = [
+            {"id": 5, "stationId": 7, "componentId": 3, "variableId": 1, "type": "MaxSet", "value": "20000"},
+            {"id": 6, "stationId": 7, "componentId": 3, "variableId": 2, "type": discharge_type,
+             "value": discharge_value}]
+        return hasura
+
+    # 1. discharge-specific MaxSet, over its maxLimit, the minLimit and the charge rating.
+    limits = await attach(reader("MaxSet", "9000", 12000), discovery(tx=False))
+    assert (limits["discharge"]["evse_rating_w"], limits["discharge"]["source"]) == (9000, "evse_rating")
+    # 2. discharge-specific maxLimit (shared), over the negative Power minLimit.
+    limits = await attach(reader("Actual", "0", 12000), discovery(tx=False))
+    assert (limits["discharge"]["evse_rating_w"], limits["discharge"]["source"]) == (
+        12000, "evse_max_limit_shared")
+    # 3. negative Power minLimit (shared), over the charge rating.
+    limits = await attach(reader("Actual", "0", None), discovery(tx=False))
+    assert (limits["discharge"]["evse_rating_w"], limits["discharge"]["source"]) == (
+        15000, "evse_max_limit_shared")
+    # The charge rating is the station's Power MaxSet.
+    assert (limits["charge"]["evse_rating_w"], limits["charge"]["source"]) == (20000, "evse_rating")
 
 
 @pytest.mark.asyncio
@@ -170,7 +226,7 @@ async def test_refused_query_is_retried_later():
     reader = PowerLimitReader(hasura, clock=lambda: now[0])
     data = discovery()
     await reader.async_attach(data, 25000)
-    assert data["stations"][0]["power_limits"]["charge"]["source"] == "evse_rating"
+    assert data["stations"][0]["power_limits"]["charge"]["source"] == "evse_max_limit_shared"
     now[0] = 100  # due again, but a refused query waits 10 minutes
     await reader.async_attach(discovery(), 25000)
     assert [c[0] for c in hasura.calls].count("ChargingNeeds") == 1

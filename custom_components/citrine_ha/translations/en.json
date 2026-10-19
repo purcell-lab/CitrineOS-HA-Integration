@@ -97,6 +97,7 @@
             "state": {
               "ev_charging_needs": "EV charging needs",
               "evse_rating": "EVSE rating",
+              "evse_max_limit_shared": "EVSE maxLimit (shared by all stations)",
               "fallback": "Fallback option"
             }
           },
@@ -122,6 +123,7 @@
             "state": {
               "ev_charging_needs": "EV charging needs",
               "evse_rating": "EVSE rating",
+              "evse_max_limit_shared": "EVSE maxLimit (shared by all stations)",
               "fallback": "Fallback option"
             }
           },

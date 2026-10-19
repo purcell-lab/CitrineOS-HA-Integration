@@ -6,9 +6,10 @@ a configured fallback.
 1. ev_charging_needs: the EV's limits from the latest ChargingNeeds row of the
    station's active transaction (NotifyEVChargingNeeds, OCPP 2.0.1 / 2.1).
 2. evse_rating: the device model rating, variable "Power" of component "EVSE"
-   (else "ChargingStation"): VariableCharacteristics.maxLimit, else the
-   VariableAttribute of type MaxSet. Discharge-specific variables are used for
-   discharge when the station reports one.
+   (else "ChargingStation"): the station's own MaxSet VariableAttribute, else
+   VariableCharacteristics.maxLimit (evse_max_limit_shared: CitrineOS keeps one
+   per variable and tenant, shared by every station). Discharge-specific
+   variables are used for discharge when the station reports one.
 3. fallback: the default_max_power_w option. OCPP 1.6 stations always use it.
 
 All reads are flat Hasura queries by id, so no relationship names are needed.
@@ -30,6 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SOURCE_EV = "ev_charging_needs"
 SOURCE_EVSE = "evse_rating"
+SOURCE_EVSE_SHARED = "evse_max_limit_shared"
 SOURCE_FALLBACK = "fallback"
 
 CHARGE = "charge"
@@ -175,18 +177,26 @@ def _kind(variable: dict[str, Any]) -> str | None:
     return None
 
 
-def _rating(characteristic: dict[str, Any] | None, attribute: dict[str, Any]) -> float | None:
+def _max_set(characteristic: dict[str, Any] | None, attribute: dict[str, Any]) -> float | None:
+    """The station's own MaxSet attribute value (W), in the characteristic's unit if known."""
     unit = (characteristic or {}).get("unit")
-    if unit not in UNITS:
+    if attribute.get("type") != "MaxSet" or unit not in UNITS:
         return None  # a rating in A or % is not a power
+    value = number(attribute.get("value"))
+    return value * UNITS[unit] if value is not None and value > 0 else None
+
+
+def _max_limit(characteristic: dict[str, Any] | None) -> float | None:
+    """VariableCharacteristics.maxLimit (W): one row per variable and tenant, shared by stations."""
+    unit = (characteristic or {}).get("unit")
     limit = number((characteristic or {}).get("maxLimit"))
-    if limit is not None and limit > 0:
-        return limit * UNITS[unit]
-    if attribute.get("type") == "MaxSet":
-        value = number(attribute.get("value"))
-        if value is not None and value > 0:
-            return value * UNITS[unit]
-    return None
+    return limit * UNITS[unit] if unit in UNITS and limit is not None and limit > 0 else None
+
+
+def _negative_min_limit(characteristic: dict[str, Any] | None) -> float | None:
+    unit = (characteristic or {}).get("unit")
+    low = number((characteristic or {}).get("minLimit"))
+    return -low * UNITS[unit] if unit in UNITS and low is not None and low < 0 else None
 
 
 def device_model_ratings(
@@ -194,13 +204,19 @@ def device_model_ratings(
     components: dict[Any, dict[str, Any]],
     variables: dict[Any, dict[str, Any]],
     characteristics: dict[Any, dict[str, Any]],
-) -> dict[str, dict[str, float]]:
-    """Ratings per station key: {"charge": W, "discharge": W}, either may be absent.
+) -> dict[str, dict[str, tuple[float, str]]]:
+    """Ratings per station key: {"charge": (W, source), "discharge": (W, source)}.
 
-    The largest EVSE rating is used (ha_reader cannot map an EVSE component to
-    the transaction's EVSE), else the ChargingStation rating. Discharge uses a
-    discharge-specific rating, else a negative Power minLimit, else the charge
-    rating: a bidirectional EVSE is rated the same both ways.
+    CitrineOS keeps one VariableCharacteristics row per variable and tenant, so
+    its maxLimit (and minLimit) is whatever any station reported last. The
+    station's own MaxSet attribute therefore wins; a characteristic is used only
+    when the station has no MaxSet, with source evse_max_limit_shared.
+
+    Charge: Power MaxSet, then Power maxLimit. Discharge: discharge-specific
+    MaxSet, then its maxLimit, then a negative Power minLimit, then the charge
+    rating (a bidirectional EVSE is rated the same both ways). Within a step
+    the largest EVSE rating is used (ha_reader cannot map an EVSE component to
+    the transaction's EVSE), else the ChargingStation rating.
     """
     found: dict[str, dict[tuple[str, str], list[float]]] = {}
     for attribute in attributes:
@@ -212,32 +228,34 @@ def device_model_ratings(
         if kind is None:
             continue
         characteristic = characteristics.get(attribute.get("variableId"))
-        station = str(attribute.get("stationId"))
-        slots = found.setdefault(station, {})
-        rating = _rating(characteristic, attribute)
-        if rating is not None:
-            slots.setdefault((component["name"], kind), []).append(rating)
-        low = number((characteristic or {}).get("minLimit"))
-        if kind == CHARGE and low is not None and low < 0 and (characteristic or {}).get("unit") in UNITS:
-            slots.setdefault((component["name"], "implicit"), []).append(-low * UNITS[characteristic.get("unit")])
-    ratings: dict[str, dict[str, float]] = {}
+        slots = found.setdefault(str(attribute.get("stationId")), {})
+        steps = [(f"{kind}_max_set", _max_set(characteristic, attribute)),
+                 (f"{kind}_max_limit", _max_limit(characteristic))]
+        if kind == CHARGE:
+            steps.append(("min_limit", _negative_min_limit(characteristic)))
+        for step, value in steps:
+            if value is not None:
+                slots.setdefault((component["name"], step), []).append(value)
+    ratings: dict[str, dict[str, tuple[float, str]]] = {}
     for station, slots in found.items():
-        def pick(kind: str) -> float | None:
-            for name in RATING_COMPONENTS:
-                values = slots.get((name, kind))
-                if values:
-                    return max(values)
+        def pick(*steps: str) -> tuple[float, str] | None:
+            for step in steps:
+                for name in RATING_COMPONENTS:
+                    values = slots.get((name, step))
+                    if values:
+                        return max(values), SOURCE_EVSE if step.endswith("max_set") else SOURCE_EVSE_SHARED
             return None
-        charge = pick(CHARGE)
-        discharge = pick(DISCHARGE) or pick("implicit") or charge
+        charge = pick("charge_max_set", "charge_max_limit")
+        discharge = pick("discharge_max_set", "discharge_max_limit", "min_limit") or charge
         ratings[station] = {k: v for k, v in ((CHARGE, charge), (DISCHARGE, discharge)) if v is not None}
     return ratings
 
 
-def select_limit(ev_w: float | None, rating_w: float | None, fallback_w: float,
+def select_limit(ev_w: float | None, rating: tuple[float, str] | None, fallback_w: float,
                  transaction_id: Any = None) -> dict[str, Any]:
     """The smallest available source, else the fallback, with its attributes."""
-    candidates = [(v, s) for v, s in ((ev_w, SOURCE_EV), (rating_w, SOURCE_EVSE)) if v is not None]
+    rating_w, rating_source = rating if rating else (None, SOURCE_EVSE)
+    candidates = [(v, s) for v, s in ((ev_w, SOURCE_EV), (rating_w, rating_source)) if v is not None]
     value, source = min(candidates, key=lambda c: c[0]) if candidates else (fallback_w, SOURCE_FALLBACK)
     return {"value": round(value), "source": source,
             "ev_limit_w": None if ev_w is None else round(ev_w),
@@ -278,7 +296,7 @@ class PowerLimitReader:
     def __init__(self, hasura: Any | None, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._hasura = hasura
         self._clock = clock
-        self._ratings: dict[str, dict[str, float]] = {}
+        self._ratings: dict[str, dict[str, tuple[float, str]]] = {}
         self._ratings_key: tuple | None = None
         self._ratings_at: float | None = None
         self._needs: dict[int, dict[str, float | None]] = {}
@@ -376,7 +394,7 @@ class PowerLimitReader:
         self._ratings_at, self._ratings_key, self._transient = now, keys, False
         integer = all(type(s.get("databaseId")) is int for s in stations)
         station_ids = [s["databaseId"] if integer else str(s["id"]) for s in stations]
-        ratings: dict[str, dict[str, float]] = {}
+        ratings: dict[str, dict[str, tuple[float, str]]] = {}
         variables = await self._query("Variables", VARIABLES_QUERY, {"names": list(RATING_NAMES)}, "Variables")
         variables = {v.get("id"): v for v in variables or [] if _kind(v)}
         if variables:
