@@ -198,8 +198,13 @@ The value is the smallest of the sources CitrineOS has, else the fallback:
    own `MaxSet` attribute value wins (`evse_rating`); only when the station has
    none is `VariableCharacteristics.maxLimit` used (`evse_max_limit_shared`).
    Discharge, in order: a discharge-specific `MaxSet` (`DischargePower`,
-   `MaxDischargePower`, ...), its maxLimit, a negative `Power` minLimit, then
-   the charge rating.
+   `MaxDischargePower`, ...), the station's negative `Power` `MinSet` (OCPP
+   2.1 signs discharge negative; `evse_rating`), the discharge-specific
+   maxLimit, a negative `Power` minLimit, then the charge rating. Each step
+   tries the EVSE component, then ChargingStation, before the next step: the
+   EVerest V2G simulator reports `MaxSet` +25000 / `MinSet` −25000 on
+   ChargingStation `Power` while its EVSE `Power` has only `Actual` (and a
+   shared 88,320 W maxLimit), so it reads 25,000 W both ways.
 3. `fallback`: the option *Fallback max charge/discharge power* (default
    25,000 W, 1,000 to 350,000 W). OCPP 1.6 stations always use it.
 

@@ -186,6 +186,15 @@ def _max_set(characteristic: dict[str, Any] | None, attribute: dict[str, Any]) -
     return value * UNITS[unit] if value is not None and value > 0 else None
 
 
+def _negative_min_set(characteristic: dict[str, Any] | None, attribute: dict[str, Any]) -> float | None:
+    """The station's own negative Power MinSet (OCPP 2.1 discharge), as a positive W value."""
+    unit = (characteristic or {}).get("unit")
+    if attribute.get("type") != "MinSet" or unit not in UNITS:
+        return None
+    value = number(attribute.get("value"))
+    return -value * UNITS[unit] if value is not None and value < 0 else None
+
+
 def _max_limit(characteristic: dict[str, Any] | None) -> float | None:
     """VariableCharacteristics.maxLimit (W): one row per variable and tenant, shared by stations."""
     unit = (characteristic or {}).get("unit")
@@ -197,6 +206,11 @@ def _negative_min_limit(characteristic: dict[str, Any] | None) -> float | None:
     unit = (characteristic or {}).get("unit")
     low = number((characteristic or {}).get("minLimit"))
     return -low * UNITS[unit] if unit in UNITS and low is not None and low < 0 else None
+
+
+# Steps read from the station's own VariableAttributes; the others come from the
+# shared VariableCharacteristics row.
+PER_STATION_STEPS = ("charge_max_set", "discharge_max_set", "min_set")
 
 
 def device_model_ratings(
@@ -213,10 +227,13 @@ def device_model_ratings(
     when the station has no MaxSet, with source evse_max_limit_shared.
 
     Charge: Power MaxSet, then Power maxLimit. Discharge: discharge-specific
-    MaxSet, then its maxLimit, then a negative Power minLimit, then the charge
-    rating (a bidirectional EVSE is rated the same both ways). Within a step
-    the largest EVSE rating is used (ha_reader cannot map an EVSE component to
-    the transaction's EVSE), else the ChargingStation rating.
+    MaxSet, then a negative Power MinSet (OCPP 2.1 signs discharge negative),
+    then the discharge-specific maxLimit, then a negative Power minLimit, then
+    the charge rating (a bidirectional EVSE is rated the same both ways).
+    Within a step the largest EVSE rating is used (ha_reader cannot map an EVSE
+    component to the transaction's EVSE), else the ChargingStation rating, so a
+    station whose EVSE has only an Actual attribute (EVerest) still gets its
+    ChargingStation MaxSet/MinSet before any shared characteristic.
     """
     found: dict[str, dict[tuple[str, str], list[float]]] = {}
     for attribute in attributes:
@@ -232,7 +249,8 @@ def device_model_ratings(
         steps = [(f"{kind}_max_set", _max_set(characteristic, attribute)),
                  (f"{kind}_max_limit", _max_limit(characteristic))]
         if kind == CHARGE:
-            steps.append(("min_limit", _negative_min_limit(characteristic)))
+            steps += [("min_set", _negative_min_set(characteristic, attribute)),
+                      ("min_limit", _negative_min_limit(characteristic))]
         for step, value in steps:
             if value is not None:
                 slots.setdefault((component["name"], step), []).append(value)
@@ -243,10 +261,10 @@ def device_model_ratings(
                 for name in RATING_COMPONENTS:
                     values = slots.get((name, step))
                     if values:
-                        return max(values), SOURCE_EVSE if step.endswith("max_set") else SOURCE_EVSE_SHARED
+                        return max(values), SOURCE_EVSE if step in PER_STATION_STEPS else SOURCE_EVSE_SHARED
             return None
         charge = pick("charge_max_set", "charge_max_limit")
-        discharge = pick("discharge_max_set", "discharge_max_limit", "min_limit") or charge
+        discharge = pick("discharge_max_set", "min_set", "discharge_max_limit", "min_limit") or charge
         ratings[station] = {k: v for k, v in ((CHARGE, charge), (DISCHARGE, discharge)) if v is not None}
     return ratings
 

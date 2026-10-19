@@ -380,3 +380,41 @@ def test_read_only_profile_entity_names():
     assert f"sensor.{slugify(sensor.name)}" == "sensor.sim_ev_everest_v2g_03_max_charge_power"
     assert sensor.native_value == 11000
     assert sensor.extra_state_attributes["source"] == "ev_charging_needs"
+
+
+@pytest.mark.asyncio
+async def test_everest_layout_charging_station_max_set_and_min_set():
+    # EVerest V2G simulator 0.1.13: the EVSE Power has only an Actual attribute and a
+    # shared board maxLimit; the ChargingStation Power carries MaxSet/MinSet ±25 kW.
+    hasura = FakeHasura(
+        characteristics=[{"id": 9, "variableId": 1, "maxLimit": 88320, "minLimit": -88320, "unit": "W"}],
+        attributes=[
+            {"id": 5, "stationId": 7, "componentId": 3, "variableId": 1, "type": "Actual", "value": "0"},
+            {"id": 6, "stationId": 7, "componentId": 4, "variableId": 1, "type": "MaxSet", "value": "25000"},
+            {"id": 7, "stationId": 7, "componentId": 4, "variableId": 1, "type": "MinSet", "value": "-25000"},
+            {"id": 8, "stationId": 7, "componentId": 4, "variableId": 1, "type": "Actual", "value": "0"}])
+    hasura.tables["Components"] = [{"id": 3, "name": "EVSE", "instance": None, "evseDatabaseId": 2},
+                                   {"id": 4, "name": "ChargingStation", "instance": None}]
+    limits = await attach(hasura, discovery(tx=False))
+    for direction in ("charge", "discharge"):
+        assert limits[direction]["value"] == 25000
+        assert limits[direction]["evse_rating_w"] == 25000
+        assert limits[direction]["source"] == "evse_rating"
+
+
+@pytest.mark.asyncio
+async def test_negative_min_set_beats_shared_discharge_limits():
+    hasura = FakeHasura(characteristics=[
+        {"id": 9, "variableId": 1, "maxLimit": 22000, "minLimit": -15000, "unit": "W"},
+        {"id": 10, "variableId": 2, "maxLimit": 12000, "unit": "W"}])
+    hasura.tables["Variables"].append({"id": 2, "name": "DischargePower", "instance": None})
+    hasura.tables["VariableAttributes"] = [
+        {"id": 5, "stationId": 7, "componentId": 3, "variableId": 1, "type": "MinSet", "value": "-11000"},
+        {"id": 6, "stationId": 7, "componentId": 3, "variableId": 2, "type": "Actual", "value": "0"}]
+    limits = await attach(hasura, discovery(tx=False))
+    assert (limits["discharge"]["evse_rating_w"], limits["discharge"]["source"]) == (11000, "evse_rating")
+    # A positive MinSet is a minimum charge power, not a discharge rating.
+    hasura.tables["VariableAttributes"][0]["value"] = "1000"
+    limits = await attach(hasura, discovery(tx=False))
+    assert (limits["discharge"]["evse_rating_w"], limits["discharge"]["source"]) == (
+        12000, "evse_max_limit_shared")
