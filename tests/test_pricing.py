@@ -495,7 +495,7 @@ async def services(c, stations, states, openadr=None):
 
     async def get_forecast(domain, name, data, target=None, blocking=False, return_response=False):
         assert (domain, name, blocking, return_response) == ("openadr3_ven", "get_forecast", True, True)
-        assert data["end"] - data["start"] == timedelta(hours=49)
+        assert data["end"] - data["start"] == timedelta(hours=25)
         eid = target["entity_id"]
         return {eid: {"payload_type": "PRICE", "unit": "AUD/kWh", "forecast": openadr[eid]}}
     hass.services.async_call = AsyncMock(side_effect=get_forecast)
@@ -635,6 +635,17 @@ async def test_lab_schedule_price_entity_attaches_absolute_price_schedule():
     with pytest.raises(ServiceValidationError, match="disabled"):
         await call(SERVICE, periods=periods, immediate=True, price_entity=state.entity_id)
     assert c201.posts == off.posts == []
+
+
+@pytest.mark.asyncio
+async def test_lab_schedule_price_schedule_covers_next_24_hours():
+    c = client();await c.control_policy()
+    # 48 h of half-hourly prices: only the first 24 h go into the profile.
+    state, start = now_forecast(minutes=30, prices=[0.1 + i / 1000 for i in range(96)])
+    call = await services(c, [station()], {state.entity_id: state})
+    await call(SERVICE, periods=[power_period(0, 3000)], immediate=True, price_entity=state.entity_id)
+    stacks = c.posts[-1][2]["chargingProfile"]["chargingSchedule"][0]["absolutePriceSchedule"]["priceRuleStacks"]
+    assert len(stacks) == 48 and sum(s["duration"] for s in stacks) == 86400
 
 
 def vtn_rows(start, prices, first_minutes=5):
