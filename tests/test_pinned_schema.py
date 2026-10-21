@@ -29,3 +29,22 @@ def test_query_fields_exist_in_pinned_v2_models():
     operation = parse(V2_DISCOVERY_QUERY).definitions[0]
     for collection in operation.selection_set.selections:
         check(collection.selection_set, collection.name.value)
+
+
+@pytest.mark.skipif(not os.getenv("CITRINE_SERVER_SOURCE"), reason="pinned source supplied in CI")
+def test_power_limit_query_fields_exist_in_pinned_v2_models():
+    from custom_components.citrine_ha.power_limits import (
+        ATTRIBUTES_QUERY, CHARACTERISTICS_QUERY, COMPONENTS_QUERY, NEEDS_QUERY, VARIABLES_QUERY)
+    root = Path(os.environ["CITRINE_SERVER_SOURCE"])
+    models = {"Variables": "variable", "VariableAttributes": "variable-attribute",
+              "Components": "component", "VariableCharacteristics": "variable-characteristics",
+              "ChargingNeeds": "charging-needs"}
+    for query in (VARIABLES_QUERY, ATTRIBUTES_QUERY.replace("STATION_KEY", "Int"), COMPONENTS_QUERY,
+                  CHARACTERISTICS_QUERY, NEEDS_QUERY):
+        for collection in parse(query).definitions[0].selection_set.selections:
+            model = collection.name.value
+            text = (root / "packages/dal/src/db/drizzle/schema" / f"{models[model]}.ts").read_text()
+            fields = set(re.findall(r"^\s{4}(\w+):", text, re.MULTILINE))
+            for field in collection.selection_set.selections:
+                assert field.selection_set is None, "power queries use no relationships"
+                assert field.name.value in fields, f"{model}.{field.name.value} is absent from pinned source"

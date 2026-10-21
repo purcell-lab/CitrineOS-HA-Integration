@@ -57,6 +57,12 @@ seconds without a fresh meter frame; stopped does not fabricate a zero sample.
 Energy values are raw meter-register readings, not session deltas, and retain
 their source timestamp and transaction ID.
 
+Every discovered station (the command station and any read-only station) also
+gets Max discharge power and Max charge power sensors (0.6.2): the smaller of
+the EV's ChargingNeeds limit and the EVSE rating, else the fallback option. They
+stay available while the station is offline; see the README's "Station power
+limits".
+
 `citrine_ha.lab_schedule` submits a multi-period schedule:
 
 ```yaml

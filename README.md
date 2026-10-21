@@ -69,6 +69,7 @@ Selectable on the fly via `select.citrine_controller_mode`:
 
 ### Discovered Chargers: `Citrine Charger <ID>`
 * **Status Sensors:** Online state, Session state, Connector count, Protocol, OCPP Heartbeat age.
+* **Power limit sensors:** Max discharge power and Max charge power (W), see [Station power limits](#station-power-limits-062).
 * **Control Selects:** Control Override (`auto`, `boost`, `pause`), Station Priority (`1 - Lowest` to `5 - Highest`), Phase Wiring (`3-Phase`, `L1`, `L2`, `L3`).
 * **Buttons:** Start Charging, Stop Charging, Apply Profile, Clear Profile, Dynamic Session Start/Stop.
 
@@ -165,6 +166,66 @@ data:
     - {startPeriod: 0, limit: 11000, dischargeLimit: -11000, setpoint: 6000, operationMode: CentralSetpoint}
 response_variable: schedule   # schedule.sent.price_schedule: id, rule stacks, horizon
 ```
+
+---
+
+## Station power limits (0.6.2)
+
+Every discovered station gets two read-only sensors in W (device class power,
+state class measurement): **Max discharge power** and **Max charge power**. A
+bridge automation can use them to cap V2G discharge and charge and to publish
+the DER nameplate, instead of a hard-coded 25 kW.
+
+| Entry | Entity IDs |
+| --- | --- |
+| Scoped lab profile, simulator `SIM-EV-EVEREST-V2G-03` | `sensor.citrineos_everest_v2g_lab_sim_ev_everest_v2g_03_max_discharge_power`, `..._max_charge_power` |
+| Scoped lab profile, other stations | `sensor.citrineos_lab_<station>_max_discharge_power` (a `SIM-EV-` station: `sensor.citrineos_everest_v2g_lab_<station>_...`) |
+| Legacy and 2.x read-only profiles | `sensor.<station>_max_discharge_power`, `sensor.<station>_max_charge_power` |
+
+The value is the smallest of the sources CitrineOS has, else the fallback:
+
+1. `ev_charging_needs`: the EV's limits from the latest `ChargingNeeds` row
+   (NotifyEVChargingNeeds) of the station's active transaction. Charge: DC
+   `evMaxPower`, else `evMaxCurrent` × `evMaxVoltage`; AC `evMaxCurrent` ×
+   `evMaxVoltage` × phases (one phase unless the parameters carry a phase
+   count). Discharge (OCPP 2.1): `evMaxDischargePower` or V2X
+   `maxDischargePower` (per-phase `_L2`/`_L3` added), else the discharge
+   current × `evMaxVoltage`. `energyAmount`, SoC and departure time are ignored.
+   A row without a transaction link counts when it is on the transaction's
+   EVSE and newer than the transaction start.
+2. `evse_rating` / `evse_max_limit_shared`: device model variable `Power` of
+   component `EVSE` (the largest EVSE), else `ChargingStation`. The station's
+   own `MaxSet` attribute value wins (`evse_rating`); only when the station has
+   none is `VariableCharacteristics.maxLimit` used (`evse_max_limit_shared`).
+   Discharge, in order: a discharge-specific `MaxSet` (`DischargePower`,
+   `MaxDischargePower`, ...), the station's negative `Power` `MinSet` (OCPP
+   2.1 signs discharge negative; `evse_rating`), the discharge-specific
+   maxLimit, a negative `Power` minLimit, then the charge rating. Each step
+   tries the EVSE component, then ChargingStation, before the next step: the
+   EVerest V2G simulator reports `MaxSet` +25000 / `MinSet` −25000 on
+   ChargingStation `Power` while its EVSE `Power` has only `Actual` (and a
+   shared 88,320 W maxLimit), so it reads 25,000 W both ways.
+3. `fallback`: the option *Fallback max charge/discharge power* (default
+   25,000 W, 1,000 to 350,000 W). OCPP 1.6 stations always use it.
+
+Attributes: `source`, `ev_limit_w`, `evse_rating_w`, `fallback_w` and
+`transaction_id`. ChargingNeeds is read with the discovery poll (at most every
+15 s, or at once when a transaction starts or ends); the device model every
+60 s. All five queries are flat reads by id, without relationships.
+
+The reads need select permission for the App's `ha_reader` on
+`VariableAttributes`, `Components`, `Variables`, `VariableCharacteristics` and
+`ChargingNeeds`. On an older CitrineOS App without them, or when a column is
+missing, the source is dropped and the sensors keep a value (the next source,
+at worst the fallback); they never go unavailable for it. The first refusal of
+each table is logged as a warning, repeats at debug, and the table is retried
+every 10 minutes. A timeout keeps the previous values until the next poll.
+
+CitrineOS keeps one `VariableCharacteristics` row per variable name and
+tenant, so a `Power` maxLimit (and minLimit) is the last value any station
+reported, not this station's. At a mixed-charger event the per-station
+`MaxSet` is therefore preferred, and `source: evse_max_limit_shared` marks a
+value taken from the shared characteristic.
 
 ---
 

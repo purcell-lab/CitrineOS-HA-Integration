@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .citrine_api import CitrineApiError, CitrineClient
 from .const import (
+    CONF_DEFAULT_MAX_POWER_W,
     CONF_EMS_ENDPOINT_PREFIX,
     CONF_EMS_TELEMETRY_LIMIT,
     CONF_EMS_TELEMETRY_SITE_ID,
@@ -23,6 +24,7 @@ from .const import (
     CONF_SCAN_INTERVAL,
     CONF_TENANT_ID,
     DEFAULT_HASURA_QUERY,
+    DEFAULT_MAX_POWER_W,
     DEFAULT_PROFILE_DURATION,
     DEFAULT_PROFILE_DISCHARGE_LIMIT,
     DEFAULT_PROFILE_KIND,
@@ -36,8 +38,11 @@ from .const import (
     DEFAULT_EMS_ENDPOINT_PREFIX,
     DEFAULT_EMS_TELEMETRY_LIMIT,
     DEFAULT_EMS_TELEMETRY_STALE_SECS,
+    MAX_MAX_POWER_W,
+    MIN_MAX_POWER_W,
 )
 from .hasura_client import HasuraAuthError, HasuraClient, HasuraError
+from .power_limits import PowerLimitReader
 from .compatibility import (
     CONF_API_PROFILE, PROFILE_V2, PROFILE_LAB, V2_PROFILES, V2_DISCOVERY_QUERY, normalize_v2_discovery,
 )
@@ -56,6 +61,17 @@ def scan_interval_seconds(entry_data: dict[str, Any], entry_options: dict[str, A
     if value is None:
         value = entry_data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     return max(1, int(value))
+
+
+def default_max_power_w(entry_data: dict[str, Any], entry_options: dict[str, Any]) -> float:
+    """Fallback for the max power sensors: the option, else 25 kW, within bounds."""
+    value = entry_options.get(CONF_DEFAULT_MAX_POWER_W, entry_data.get(CONF_DEFAULT_MAX_POWER_W))
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(DEFAULT_MAX_POWER_W)
+    return min(max(value, MIN_MAX_POWER_W), MAX_MAX_POWER_W)
+
 
 class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Data coordinator for discovered charging stations."""
@@ -85,11 +101,15 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._protocol_cache: dict[str, str] = {}
         self._capability_cache: dict[str, dict[str, Any]] = {}
         self._profile_prefs: dict[str, dict[str, Any]] = {}
+        self._power_limits = PowerLimitReader(hasura_client)
 
     async def _async_update_data(self) -> dict[str, Any]:
         tenant_id = int(self._entry_data[CONF_TENANT_ID])
         try:
-            return await self._fetch_discovery(tenant_id)
+            data = await self._fetch_discovery(tenant_id)
+            # Never fails discovery: a refused or missing table only drops a source.
+            await self._power_limits.async_attach(data, self.default_max_power_w)
+            return data
         except (CitrineApiError, HasuraError, ValueError) as err:
             # A lab dispatch still ends after its evidence window while polls fail.
             expire = getattr(self._citrine_client, "expire_awaiting", None)
@@ -422,6 +442,10 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("EMS intake telemetry unavailable: %s", err)
 
         return intake_telemetry
+
+    @property
+    def default_max_power_w(self) -> float:
+        return default_max_power_w(self._entry_data, self._entry_options)
 
     def get_station_protocol(self, station_id: str, fallback: str | None = None) -> str | None:
         station_key = str(station_id)

@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 from .const import CONF_TENANT_ID, DOMAIN
 from .coordinator import CitrineCoordinator
 from .load_controller import CitrineLoadController
+from .power_limits import CHARGE, DISCHARGE, sensor_state
 
 
 async def async_setup_entry(
@@ -54,6 +55,8 @@ async def async_setup_entry(
             entities.append(CitrineStationActiveSessionSensor(coordinator, entry, station))
             entities.append(CitrineStationProfileStatusSensor(coordinator, entry, station))
             entities.append(CitrineStationHeartbeatAgeSensor(coordinator, entry, station))
+            entities.append(CitrineStationMaxPowerSensor(coordinator, entry, station, DISCHARGE))
+            entities.append(CitrineStationMaxPowerSensor(coordinator, entry, station, CHARGE))
         return entities
 
     async_add_entities(_build_entities())
@@ -512,6 +515,48 @@ class CitrineStationProfileStatusSensor(CoordinatorEntity[CitrineCoordinator], S
                 capabilities.get("supports_dynamic_profiles", False)
             ),
         }
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return _device_info(self._entry, self._station())
+
+    def _station(self) -> dict[str, Any]:
+        for station in self.coordinator.data.get("stations", []):
+            if str(station.get("id")) == self._station_id:
+                return station
+        return {"id": self._station_id}
+
+
+class CitrineStationMaxPowerSensor(CoordinatorEntity[CitrineCoordinator], SensorEntity):
+    """Usable charge or discharge power: EV limit, EVSE rating, else the fallback option."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+
+    def __init__(
+        self,
+        coordinator: CitrineCoordinator,
+        entry: ConfigEntry,
+        station: dict[str, Any],
+        direction: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._direction = direction
+        self._station_id = str(station["id"])
+        self._attr_unique_id = f"{entry.entry_id}_{self._station_id}_max_{direction}_power"
+        self._attr_name = f"{self._station_id} Max {direction} power"
+        self._attr_translation_key = f"max_{direction}_power"
+        self._attr_icon = "mdi:transmission-tower-export" if direction == DISCHARGE else "mdi:ev-plug-ccs2"
+
+    @property
+    def native_value(self) -> int:
+        return sensor_state(self._station(), self._direction, self.coordinator.default_max_power_w)[0]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return sensor_state(self._station(), self._direction, self.coordinator.default_max_power_w)[1]
 
     @property
     def device_info(self) -> DeviceInfo:
