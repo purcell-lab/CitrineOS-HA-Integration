@@ -1,4 +1,7 @@
 """Explicit API profiles and conservative control boundaries."""
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 CONF_API_PROFILE = "api_profile"
 CONF_READ_ONLY = "read_only"
@@ -58,26 +61,44 @@ def normalize_v2_discovery(result, tenant_id):
             raise ValueError("Invalid discovery row or tenant mismatch")
         collections.append(rows)
     stations, connectors, transactions = collections
+    keys = set()
+    by_name = {}
+    for row in stations:
+        key = row.get("id")
+        if type(key) is not int or key in keys:
+            raise ValueError("Missing or ambiguous station identity")
+        keys.add(key)
+        name = row.get("ocppConnectionName")
+        if isinstance(name, str) and name.strip():
+            by_name.setdefault(name, []).append(row)
+    # A station row without a usable connection name (a charger that sent an
+    # empty identity), or one whose name another row also uses, is left out
+    # with a warning: one bad row must not take every other station offline.
+    # Its connectors and transactions are left out with it.
     names = {}
-    seen_names = set()
     normalized = []
     protocols = {}
     for row in stations:
-        key, name = row.get("id"), row.get("ocppConnectionName")
-        if (type(key) is not int or not isinstance(name, str) or not name.strip()
-                or key in names or name in seen_names):
-            raise ValueError("Missing or ambiguous station identity")
+        key, name = row["id"], row.get("ocppConnectionName")
+        if not isinstance(name, str) or not name.strip():
+            _LOGGER.warning("Skipping CitrineOS station %s: no OCPP connection name", key)
+            continue
+        if len(by_name[name]) > 1:
+            _LOGGER.warning("Skipping CitrineOS station %s: connection name %r is used by %d stations",
+                            key, name, len(by_name[name]))
+            continue
         names[key] = name
         protocols[key] = row.get("protocol")
-        seen_names.add(name)
         normalized.append({**row, "databaseId": key, "id": name})
     children = []
     for is_connector, rows in ((True, connectors), (False, transactions)):
         values = []
         for row in rows:
             key = row.get("stationId")
-            if type(key) is not int or key not in names:
+            if type(key) is not int or key not in keys:
                 raise ValueError("Unresolved station relationship")
+            if key not in names:
+                continue
             item = {**row, "databaseStationId": key, "stationId": names[key]}
             if is_connector:
                 evse = row.get("Evse")
