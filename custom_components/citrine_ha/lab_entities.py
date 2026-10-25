@@ -24,14 +24,14 @@ from .pricing import (TOTAL_COST_MAX, amber_intervals, build_cost_updated, build
                       build_tariff, current_and_next, openadr_forecasts, schedule_summary,
                       tariff_summary)
 
-SERVICE = "lab_schedule"
-SERVICE_RECONCILE = "lab_reconcile"
-SERVICE_COST = "lab_cost_update"
-SERVICE_TARIFF = "lab_default_tariff"
-SERVICE_DER_SET = "lab_set_der_control"
-SERVICE_DER_GET = "lab_get_der_control"
-SERVICE_DER_CLEAR = "lab_clear_der_control"
-SERVICE_DER_EVENTS = "lab_der_events"
+SERVICE = "set_tx_profile"
+SERVICE_RECONCILE = "reconcile_command_state"
+SERVICE_COST = "cost_updated"
+SERVICE_TARIFF = "set_default_tariff"
+SERVICE_DER_SET = "set_der_control"
+SERVICE_DER_GET = "get_der_control"
+SERVICE_DER_CLEAR = "clear_der_control"
+SERVICE_DER_EVENTS = "get_der_events"
 # Service field -> OCPP key: the fields each controlType's control carries.
 DER_COMMON = {"priority": "priority", "start_time": "startTime", "duration": "duration"}
 DER_FIELDS = {
@@ -272,10 +272,10 @@ def der_set_body(data, der):
     missing = sorted(f for f in fields if data.get(f) is None)
     extra = sorted(f for f in DER_ALL_FIELDS - set(fields) if data.get(f) is not None)
     if missing or extra:
+        problems = ([f"missing {', '.join(missing)}"] if missing else []) + (
+            [f"not used by {ctype}: {', '.join(extra)}"] if extra else [])
         raise ServiceValidationError(
-            f"{ctype} needs {', '.join(sorted(fields))}"
-            + (f"; missing {', '.join(missing)}" if missing else "")
-            + (f"; not used by {ctype}: {', '.join(extra)}" if extra else ""))
+            f"{'; '.join(problems)} ({ctype} takes {', '.join(sorted(fields))})")
     limits = der["limits"]
     if ctype == "LimitMaxDischarge":
         low, high = limits["pct_max_discharge_power"]

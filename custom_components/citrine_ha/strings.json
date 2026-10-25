@@ -144,7 +144,7 @@
     }
   },
   "services": {
-    "lab_schedule": {
+    "set_tx_profile": {
       "name": "Submit scoped lab schedule",
       "description": "Send one bounded schedule to the active lab transaction, optionally with an OCPP 2.1 absolutePriceSchedule from an Amber forecast.",
       "fields": {
@@ -170,7 +170,7 @@
         }
       }
     },
-    "lab_cost_update": {
+    "cost_updated": {
       "name": "Send scoped lab cost update",
       "description": "Send CostUpdated with the current and next Amber price for the command station's active transaction.",
       "fields": {
@@ -188,7 +188,7 @@
         }
       }
     },
-    "lab_default_tariff": {
+    "set_default_tariff": {
       "name": "Send scoped lab default tariff",
       "description": "Send SetDefaultTariff (OCPP 2.1) built from the Amber forecast to a listed tariff station.",
       "fields": {
@@ -218,7 +218,7 @@
         }
       }
     },
-    "lab_set_der_control": {
+    "set_der_control": {
       "name": "Set scoped lab DER control",
       "description": "Send SetDERControl (OCPP 2.1) with one control of the chosen type to the command station.",
       "fields": {
@@ -272,7 +272,7 @@
         }
       }
     },
-    "lab_get_der_control": {
+    "get_der_control": {
       "name": "Get scoped lab DER controls",
       "description": "Send GetDERControl (OCPP 2.1) to the command station and return the reports for the request.",
       "fields": {
@@ -298,7 +298,7 @@
         }
       }
     },
-    "lab_clear_der_control": {
+    "clear_der_control": {
       "name": "Clear scoped lab DER controls",
       "description": "Send ClearDERControl (OCPP 2.1) to the command station.",
       "fields": {
@@ -320,9 +320,19 @@
         }
       }
     },
-    "lab_der_events": {
+    "get_der_events": {
       "name": "Read scoped lab DER events",
       "description": "Return the command station's newest DER reports and notifications, at most 20.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        }
+      }
+    },
+    "reconcile_command_state": {
+      "name": "Reconcile scoped lab command state",
+      "description": "Re-read the CSMS (readiness, command policy and the command station's active transaction) and resolve an outcome_unknown, dispatch_not_confirmed or awaiting-evidence command without reloading the integration. A command sent less than 90 seconds ago may still land and is never cleared; the call fails with the remaining wait instead. Returns the resolved command state.",
       "fields": {
         "entry_id": {
           "name": "Entry ID",

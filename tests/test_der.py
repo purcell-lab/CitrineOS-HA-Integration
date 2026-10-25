@@ -388,3 +388,25 @@ async def test_gateway_errors_map_to_home_assistant_error_with_their_text(error,
         await call(SERVICE_DER_SET, control_type="LimitMaxDischarge", control_id="a", pct_max_discharge_power=10)
     assert not isinstance(err.value, ServiceValidationError)
     assert len(c.posts) == 1
+
+
+def test_service_names_are_the_ocpp_actions_without_a_lab_prefix():
+    """The scoped services are named for the OCPP 2.1 actions they send, in code, services.yaml and strings."""
+    import json
+    from pathlib import Path
+
+    import yaml
+
+    from custom_components.citrine_ha import lab_entities
+
+    root = Path(__file__).resolve().parents[1] / "custom_components" / "citrine_ha"
+    names = {lab_entities.SERVICE, lab_entities.SERVICE_RECONCILE, lab_entities.SERVICE_COST,
+             lab_entities.SERVICE_TARIFF, lab_entities.SERVICE_DER_SET, lab_entities.SERVICE_DER_GET,
+             lab_entities.SERVICE_DER_CLEAR, lab_entities.SERVICE_DER_EVENTS}
+    assert names == {"set_tx_profile", "reconcile_command_state", "cost_updated", "set_default_tariff",
+                     "set_der_control", "get_der_control", "clear_der_control", "get_der_events"}
+    documented = set(yaml.safe_load((root / "services.yaml").read_text()))
+    assert names <= documented
+    for strings in ("strings.json", "translations/en.json"):
+        assert names <= set(json.loads((root / strings).read_text())["services"]), strings
+    assert not [n for n in documented if n.startswith("lab_")]

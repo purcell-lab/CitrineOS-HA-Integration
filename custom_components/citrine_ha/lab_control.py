@@ -620,7 +620,7 @@ class ScopedLabClient(CitrineClient):
         if action != "stop" and self.last_command.get("state") in UNRESOLVED:
             raise CitrineApiError(
                 "Previous outcome unresolved; reconcile before further commands "
-                "(citrine_ha.lab_reconcile or the Reconcile command state button)")
+                "(citrine_ha.reconcile_command_state or the Reconcile command state button)")
         if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == AWAITING:
             remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
             raise CitrineApiError(
