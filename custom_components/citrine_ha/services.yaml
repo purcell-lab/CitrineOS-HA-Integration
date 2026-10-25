@@ -349,7 +349,7 @@ emergency_safe_mode:
       required: false
       selector:
         text:
-lab_schedule:
+set_tx_profile:
   name: Submit scoped lab schedule
   description: Send one bounded OCPP 2.1 schedule to the currently active EVerest lab transaction. W only, 600 seconds maximum, no fallback or retry. Periods are V2G CentralSetpoint periods or AC charging-only limits (optional numberPhases 1 or 3). immediate starts the schedule now, so a replacement leaves no unlimited gap.
   fields:
@@ -378,7 +378,7 @@ lab_schedule:
         entity:
           domain: sensor
 
-lab_cost_update:
+cost_updated:
   name: Send scoped lab cost update
   description: Send CostUpdated with California Pricing customData (current Amber price, the next interval and a price text) for the command station's active transaction. OCPP 2.1 and 2.0.1; needs price commands enabled in the CitrineOS App. Information only; returns what was sent and the dispatch state.
   fields:
@@ -400,7 +400,7 @@ lab_cost_update:
           step: 0.01
           mode: box
 
-lab_default_tariff:
+set_default_tariff:
   name: Send scoped lab default tariff
   description: Send SetDefaultTariff (OCPP 2.1) built from the Amber forecast, AUD/kWh excluding GST with a GST 10 % tax rate, local times of day. Optional feed-in prices become export entries the station pays. Only stations listed in the App's tariff_stations; returns the station's status (Accepted, Rejected, CALLERROR NotImplemented ...).
   fields:
@@ -437,9 +437,161 @@ lab_default_tariff:
           max: 288
           mode: box
 
-lab_reconcile:
+reconcile_command_state:
   name: Reconcile scoped lab command state
   description: Re-read the CSMS (readiness, command policy and the command station's active transaction) and resolve an outcome_unknown, dispatch_not_confirmed or awaiting-evidence command without reloading the integration. A command sent less than 90 seconds ago may still land and is never cleared; the call fails with the remaining wait instead. Returns the resolved command state.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+
+set_der_control:
+  name: Set scoped lab DER control
+  description: Send SetDERControl (OCPP 2.1) to the command station. Fill in only the fields of the chosen control type (LimitMaxDischarge pct_max_discharge_power; FixedPFInject or FixedPFAbsorb displacement and excitation; FixedVar setpoint and unit); missing or extra fields fail before anything is sent. Needs the App's der_commands enabled; returns the station's status (Accepted, Rejected, NotSupported, NotFound or CALLERROR ...). A 502 or 504 means the outcome may be unknown; check with get_der_control, do not retry automatically.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    control_type:
+      required: true
+      selector:
+        select:
+          options:
+            - LimitMaxDischarge
+            - FixedPFInject
+            - FixedPFAbsorb
+            - FixedVar
+    control_id:
+      required: true
+      example: "lab-limit-1"
+      selector:
+        text:
+    is_default:
+      default: false
+      selector:
+        boolean:
+    priority:
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 1000
+          mode: box
+    pct_max_discharge_power:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+          mode: box
+    displacement:
+      required: false
+      selector:
+        number:
+          min: 0.01
+          max: 1
+          step: 0.01
+          mode: box
+    excitation:
+      required: false
+      selector:
+        boolean:
+    setpoint:
+      required: false
+      selector:
+        number:
+          min: -100
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+          mode: box
+    unit:
+      required: false
+      selector:
+        select:
+          options:
+            - PctMaxW
+            - PctMaxVar
+            - PctVarAvail
+    start_time:
+      required: false
+      selector:
+        datetime:
+    duration:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 86400
+          unit_of_measurement: s
+          mode: box
+
+get_der_control:
+  name: Get scoped lab DER controls
+  description: Send GetDERControl (OCPP 2.1) to the command station and return its status with the ReportDERControl reports for the request ID (collected for up to 5 seconds after Accepted). Leave the filters empty for every control.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    request_id:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 2147483647
+          mode: box
+    is_default:
+      required: false
+      selector:
+        boolean:
+    control_type:
+      required: false
+      selector:
+        select:
+          options:
+            - LimitMaxDischarge
+            - FixedPFInject
+            - FixedPFAbsorb
+            - FixedVar
+    control_id:
+      required: false
+      selector:
+        text:
+
+clear_der_control:
+  name: Clear scoped lab DER controls
+  description: Send ClearDERControl (OCPP 2.1) to the command station for its default or scheduled controls, optionally only one control type or control ID. Returns the station's status. A 502 or 504 means the outcome may be unknown; check with get_der_control, do not retry automatically.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    is_default:
+      required: true
+      selector:
+        boolean:
+    control_type:
+      required: false
+      selector:
+        select:
+          options:
+            - LimitMaxDischarge
+            - FixedPFInject
+            - FixedPFAbsorb
+            - FixedVar
+    control_id:
+      required: false
+      selector:
+        text:
+
+get_der_events:
+  name: Read scoped lab DER events
+  description: Return the command station's newest DER messages (ReportDERControl, NotifyDERStartStop, NotifyDERAlarm), newest first, at most 20.
   fields:
     entry_id:
       required: true

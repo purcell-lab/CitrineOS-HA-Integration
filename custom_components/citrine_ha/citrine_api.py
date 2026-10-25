@@ -44,9 +44,20 @@ class CitrineTransportError(CitrineApiError):
 class CitrineHttpError(CitrineApiError):
     """The server answered with an HTTP error status."""
 
-    def __init__(self, message: str, status: int) -> None:
+    def __init__(self, message: str, status: int, detail: str | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.detail = detail
+
+
+def error_detail(text: str | None) -> str | None:
+    """The lab gateway's {"error": "..."} text from an error body, if it has one."""
+    try:
+        body = json.loads(text or "")
+    except ValueError:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    return error[:300] if isinstance(error, str) and error else None
 
 
 class CitrineClient:
@@ -905,12 +916,16 @@ class CitrineClient:
                 allow_redirects=False,
             ) as resp:
                 if resp.status in (401, 403):
-                    raise CitrineAuthError("Authentication or authorization failed")
+                    detail = error_detail(await resp.text())
+                    raise CitrineAuthError(
+                        "Authentication or authorization failed" + (f": {detail}" if detail else ""))
 
                 text = await resp.text()
                 if resp.status >= 400:
+                    detail = error_detail(text)
                     raise CitrineHttpError(
-                        f"Citrine API {method} {path} failed ({resp.status})", resp.status
+                        f"Citrine API {method} {path} failed ({resp.status})"
+                        + (f": {detail}" if detail else ""), resp.status, detail
                     )
                 if 300 <= resp.status < 400:
                     raise CitrineApiError("Citrine API redirect refused")

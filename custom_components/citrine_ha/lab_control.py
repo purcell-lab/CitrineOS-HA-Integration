@@ -53,6 +53,23 @@ AWAITING = "dispatched_awaiting_station_evidence"
 # Information-only price messages (citrineos_server 0.7.0 price_commands).
 PRICE_ACTIONS = ("cost_update", "tariff")
 PRICES_DISABLED = {"enabled": False}
+# OCPP 2.1 DER control (CitrineOS Isolated Lab App 0.10.0 der_commands). Only these
+# routes: a policy cannot point a DER message elsewhere.
+DER_DISABLED = {"enabled": False}
+DER_ROUTES = {
+    "set": "/ocpp/2.1/smartcharging/setDERControl",
+    "get": "/ocpp/2.1/smartcharging/getDERControl",
+    "clear": "/ocpp/2.1/smartcharging/clearDERControl",
+}
+DER_EVENTS = "/lab/der-events"
+# controlType -> the one control field its SetDERControl carries.
+DER_TYPES = {"LimitMaxDischarge": "limitMaxDischarge", "FixedPFInject": "fixedPFInject",
+             "FixedPFAbsorb": "fixedPFAbsorb", "FixedVar": "fixedVar"}
+DER_UNITS = ("PctMaxW", "PctMaxVar", "PctVarAvail")
+DER_LIMITS = {"pct_max_discharge_power": [0, 100], "displacement": [0, 1],
+              "var_setpoint_pct": [-100, 100], "max_duration_s": 86400}
+DER_CONTROL_ID = re.compile(r"[A-Za-z0-9._:-]{1,36}")
+DER_REQUEST_ID_MAX = 2147483647
 
 
 class CitrineUnavailableError(CitrineApiError):
@@ -113,6 +130,97 @@ def parse_price_commands(policy):
     return {"enabled": True, "currency": p["currency"], "price_schedule": schedule,
             "cost_updated_by_protocol": dict(cost), "default_tariff": p.get("default_tariff"),
             "tariff_limits": limits, "tariff_stations": list(stations)}
+
+
+def parse_der_commands(policy):
+    """Normalise the policy's optional der_commands key. Never raises.
+
+    Absent, disabled or malformed means DER controls off; it never affects the
+    exact compatibility check on the rest of the policy. The target is always
+    the policy's command station on OCPP 2.1.
+    """
+    p = policy.get("der_commands") if isinstance(policy, dict) else None
+    if not isinstance(p, dict) or p.get("enabled") is not True:
+        return dict(DER_DISABLED)
+    limits, types = p.get("limits", {}), p.get("control_types")
+    if not isinstance(limits, dict) or set(limits) - set(DER_LIMITS):
+        return {**DER_DISABLED, "invalid": True}
+    limits = {**DER_LIMITS, **limits}
+
+    def bounds(key, low, high):
+        b = limits[key]
+        return (isinstance(b, list) and len(b) == 2 and all(number(x, low, high) for x in b)
+                and b[0] < b[1])
+
+    if (p.get("station_id") != policy.get("station_id") or p.get("protocol") != PROTOCOL
+            or p.get("routes") != DER_ROUTES or p.get("events") != DER_EVENTS
+            or not isinstance(types, list) or not types or not set(types) <= set(DER_TYPES)
+            or len(set(types)) != len(types)
+            or not bounds("pct_max_discharge_power", 0, 100) or not bounds("displacement", 0, 1)
+            or not bounds("var_setpoint_pct", -100, 100)
+            or not integer(limits["max_duration_s"], 1, 86400)):
+        return {**DER_DISABLED, "invalid": True}
+    return {"enabled": True, "station_id": p["station_id"], "protocol": PROTOCOL,
+            "routes": dict(DER_ROUTES), "events": DER_EVENTS, "control_types": list(types),
+            "limits": {k: list(v) if isinstance(v, list) else v for k, v in limits.items()}}
+
+
+def valid_der_control(control_type, control, limits):
+    """One SetDERControl control field, mirroring the gateway's lab bounds."""
+    common = {"priority", "startTime", "duration"}
+    if (not isinstance(control, dict) or not integer(control.get("priority"), 0, 2147483647)
+            or ("startTime" in control and (not isinstance(control["startTime"], str)
+                                            or _parse_time(control["startTime"]) is None))
+            or ("duration" in control and not integer(control["duration"], 1, limits["max_duration_s"]))):
+        return False
+    if control_type == "LimitMaxDischarge":
+        low, high = limits["pct_max_discharge_power"]
+        return (not set(control) - common - {"pctMaxDischargePower"}
+                and number(control.get("pctMaxDischargePower"), low, high))
+    if control_type in ("FixedPFInject", "FixedPFAbsorb"):
+        low, high = limits["displacement"]
+        d = control.get("displacement")
+        return (not set(control) - common - {"displacement", "excitation"}
+                and number(d, low, high) and d > low and isinstance(control.get("excitation"), bool))
+    if control_type == "FixedVar":
+        low, high = limits["var_setpoint_pct"]
+        return (not set(control) - common - {"setpoint", "unit"}
+                and number(control.get("setpoint"), low, high) and control.get("unit") in DER_UNITS)
+    return False
+
+
+def der_selector(body, types):
+    """The optional isDefault, controlType and controlId of a get or clear."""
+    return (("isDefault" not in body or isinstance(body["isDefault"], bool))
+            and ("controlType" not in body or body["controlType"] in types)
+            and ("controlId" not in body or (isinstance(body["controlId"], str)
+                                             and DER_CONTROL_ID.fullmatch(body["controlId"]))))
+
+
+def valid_der_set(body, der):
+    if not isinstance(body, dict):
+        return False
+    field = DER_TYPES.get(body.get("controlType"))
+    return (field is not None and body["controlType"] in der["control_types"]
+            and set(body) == {"isDefault", "controlId", "controlType", field}
+            and isinstance(body["isDefault"], bool) and isinstance(body["controlId"], str)
+            and DER_CONTROL_ID.fullmatch(body["controlId"]) is not None
+            and valid_der_control(body["controlType"], body[field], der["limits"]))
+
+
+def valid_der_get(body, der):
+    return (isinstance(body, dict) and not set(body) - {"requestId", "isDefault", "controlType", "controlId"}
+            and integer(body.get("requestId"), 0, DER_REQUEST_ID_MAX)
+            and der_selector(body, der["control_types"]))
+
+
+def valid_der_clear(body, der):
+    return (isinstance(body, dict) and not set(body) - {"isDefault", "controlType", "controlId"}
+            and isinstance(body.get("isDefault"), bool) and der_selector(body, der["control_types"]))
+
+
+class DerOutcomeUnknownError(CitrineApiError):
+    """A DER message CitrineOS may not have sent, or the station did not answer in time."""
 
 
 def paths_for(protocol):
@@ -276,6 +384,8 @@ class ScopedLabClient(CitrineClient):
         self.real_devices = False
         # Off until a policy reports price_commands enabled.
         self.price_commands: dict[str, Any] = dict(PRICES_DISABLED)
+        # Off until a policy reports der_commands enabled.
+        self.der_commands: dict[str, Any] = dict(DER_DISABLED)
         self.last_command: dict[str, Any] = {"state": "not_sent"}
         self.evidence_timeout = EVIDENCE_TIMEOUT_S
         # Unknown until the first readiness check; only a failed check blocks commands.
@@ -461,6 +571,10 @@ class ScopedLabClient(CitrineClient):
         if prices.get("invalid") and not self.price_commands.get("invalid"):
             _LOGGER.warning("Server price_commands policy is malformed; price commands stay disabled")
         self.price_commands = prices
+        der = parse_der_commands(p)
+        if der.get("invalid") and not self.der_commands.get("invalid"):
+            _LOGGER.warning("Server der_commands policy is malformed; DER controls stay disabled")
+        self.der_commands = der
         return p
 
     async def _ping(self):
@@ -506,7 +620,7 @@ class ScopedLabClient(CitrineClient):
         if action != "stop" and self.last_command.get("state") in UNRESOLVED:
             raise CitrineApiError(
                 "Previous outcome unresolved; reconcile before further commands "
-                "(citrine_ha.lab_reconcile or the Reconcile command state button)")
+                "(citrine_ha.reconcile_command_state or the Reconcile command state button)")
         if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == AWAITING:
             remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
             raise CitrineApiError(
@@ -648,6 +762,75 @@ class ScopedLabClient(CitrineClient):
             raise CitrineCompatibilityError("Clear requires only an exact profile ID after transaction closure")
         return await self._dispatch("clear", {"chargingProfileId": profile_id},
                                     protocol=protocol, station_id=station_id)
+
+    def require_der(self, der=None):
+        der = der or self.der_commands
+        if not der.get("enabled"):
+            raise CitrineCompatibilityError(
+                "DER controls are disabled by the server policy (der_commands_enabled)"
+                + ("; its der_commands policy is malformed" if der.get("invalid") else ""))
+        return der
+
+    async def _der(self, action, body=None, valid=None):
+        """One DER message on the route the fresh policy names. Never retried.
+
+        DER messages carry their own station reply, so they do not replace the
+        Start, Stop or profile outcome in last_command.
+        """
+        if self.read_only:
+            raise CitrineReadOnlyError("Lab controls are disabled")
+        self.require_der()
+        if self._command_lock.locked():
+            raise CitrineApiError("A lab command is already in progress")
+        self.require_csms()
+        async with self._command_lock:
+            await self._csms_call(self.ready())
+            await self._csms_call(self.control_policy())
+            self._csms_recovered()
+            # A DER switch turned off, or limits narrowed, since the last poll is honoured.
+            der = self.require_der()
+            if valid is not None and not valid(body, der):
+                raise CitrineCompatibilityError("DER request outside the server's DER policy")
+            if action == "events":
+                reply = await self._command_client._request("GET", der["events"])
+                if not isinstance(reply, dict) or not isinstance(reply.get("events"), list):
+                    raise CitrineApiError("Unexpected /lab/der-events reply")
+                return reply
+            try:
+                return await self._command_client._request(
+                    "POST", der["routes"][action],
+                    params={"identifier": der["station_id"], "tenantId": 1}, json=body)
+            except (CitrineHttpError, CitrineTransportError) as err:
+                status = getattr(err, "status", None)
+                if status in (502, 504) or isinstance(err, CitrineTransportError):
+                    what = {502: "CitrineOS did not send it", 504: "no station reply in 8 s"}.get(
+                        status, "no gateway reply")
+                    detail = getattr(err, "detail", None)
+                    raise DerOutcomeUnknownError(
+                        f"{action}DERControl: {what}" + (f" ({detail})" if detail else "")
+                        + "; the outcome may be unknown, do not retry automatically") from err
+                raise
+
+    async def set_der_control(self, body):
+        """SetDERControl: exactly one control matching controlType, inside the lab bounds."""
+        if not valid_der_set(body, self.require_der()):
+            raise CitrineCompatibilityError("DER control outside the server's DER policy")
+        return await self._der("set", body, valid_der_set)
+
+    async def get_der_control(self, body):
+        """GetDERControl: the station's status and the reports carrying requestId."""
+        if not valid_der_get(body, self.require_der()):
+            raise CitrineCompatibilityError("GetDERControl request outside the server's DER policy")
+        return await self._der("get", body, valid_der_get)
+
+    async def clear_der_control(self, body):
+        if not valid_der_clear(body, self.require_der()):
+            raise CitrineCompatibilityError("ClearDERControl request outside the server's DER policy")
+        return await self._der("clear", body, valid_der_clear)
+
+    async def der_events(self):
+        """The newest DER reports and notifications from the command station (at most 20)."""
+        return await self._der("events")
 
     async def set_station_limit(self, **kwargs):
         raise CitrineCompatibilityError("Station-wide limits are not enabled in the lab profile")

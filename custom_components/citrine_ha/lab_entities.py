@@ -1,5 +1,6 @@
 """Small, explicit manual control surface for the single enrolled command station."""
 from datetime import UTC, timedelta
+import secrets
 from types import SimpleNamespace
 
 import voluptuous as vol
@@ -15,17 +16,31 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .citrine_api import CitrineApiError
-from .lab_control import (PROFILE_ID, PROTOCOL, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient,
-                          power_period, number)
+from .lab_control import (DER_CONTROL_ID, DER_REQUEST_ID_MAX, DER_TYPES, DER_UNITS, PROFILE_ID, PROTOCOL,
+                          MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient, power_period,
+                          number)
 from .power_limits import CHARGE, DISCHARGE, sensor_state
 from .pricing import (TOTAL_COST_MAX, amber_intervals, build_cost_updated, build_price_schedule,
                       build_tariff, current_and_next, openadr_forecasts, schedule_summary,
                       tariff_summary)
 
-SERVICE = "lab_schedule"
-SERVICE_RECONCILE = "lab_reconcile"
-SERVICE_COST = "lab_cost_update"
-SERVICE_TARIFF = "lab_default_tariff"
+SERVICE = "set_tx_profile"
+SERVICE_RECONCILE = "reconcile_command_state"
+SERVICE_COST = "cost_updated"
+SERVICE_TARIFF = "set_default_tariff"
+SERVICE_DER_SET = "set_der_control"
+SERVICE_DER_GET = "get_der_control"
+SERVICE_DER_CLEAR = "clear_der_control"
+SERVICE_DER_EVENTS = "get_der_events"
+# Service field -> OCPP key: the fields each controlType's control carries.
+DER_COMMON = {"priority": "priority", "start_time": "startTime", "duration": "duration"}
+DER_FIELDS = {
+    "LimitMaxDischarge": {"pct_max_discharge_power": "pctMaxDischargePower"},
+    "FixedPFInject": {"displacement": "displacement", "excitation": "excitation"},
+    "FixedPFAbsorb": {"displacement": "displacement", "excitation": "excitation"},
+    "FixedVar": {"setpoint": "setpoint", "unit": "unit"},
+}
+DER_ALL_FIELDS = {f for fields in DER_FIELDS.values() for f in fields}
 
 
 def station(data, station_id):
@@ -231,6 +246,119 @@ async def default_tariff(ctx, state, *, export_state=None, station_id=None, evse
     finally:
         c.async_update_listeners()
     return result(client, {"station_id": sid, **tariff_summary({"evseId": evse_id, "tariff": tariff})})
+
+
+def require_der(client):
+    der = client.der_commands
+    if not der.get("enabled"):
+        raise ServiceValidationError(
+            "DER controls are disabled: the CitrineOS server policy reports no enabled "
+            "der_commands (CitrineOS Isolated Lab App 0.10.0 der_commands_enabled)"
+            + ("; its der_commands policy is malformed" if der.get("invalid") else ""))
+    return der
+
+
+def der_set_body(data, der):
+    """SetDERControl with exactly the one control field matching control_type.
+
+    Missing or extra fields for the type, or values outside the server's DER
+    limits, are refused before anything is sent.
+    """
+    ctype = data["control_type"]
+    if ctype not in der["control_types"]:
+        raise ServiceValidationError(
+            f"{ctype} is not offered by the server DER policy ({', '.join(der['control_types'])})")
+    fields = DER_FIELDS[ctype]
+    missing = sorted(f for f in fields if data.get(f) is None)
+    extra = sorted(f for f in DER_ALL_FIELDS - set(fields) if data.get(f) is not None)
+    if missing or extra:
+        problems = ([f"missing {', '.join(missing)}"] if missing else []) + (
+            [f"not used by {ctype}: {', '.join(extra)}"] if extra else [])
+        raise ServiceValidationError(
+            f"{'; '.join(problems)} ({ctype} takes {', '.join(sorted(fields))})")
+    limits = der["limits"]
+    if ctype == "LimitMaxDischarge":
+        low, high = limits["pct_max_discharge_power"]
+        if not number(data["pct_max_discharge_power"], low, high):
+            raise ServiceValidationError(f"pct_max_discharge_power must be {low} to {high} %")
+    elif ctype == "FixedVar":
+        low, high = limits["var_setpoint_pct"]
+        if not number(data["setpoint"], low, high):
+            raise ServiceValidationError(f"setpoint must be {low} to {high} %")
+    else:
+        low, high = limits["displacement"]
+        if not number(data["displacement"], low, high) or data["displacement"] <= low:
+            raise ServiceValidationError(f"displacement must be above {low} and at most {high}")
+    if data.get("duration") is not None and data["duration"] > limits["max_duration_s"]:
+        raise ServiceValidationError(f"duration must be 1 to {limits['max_duration_s']} s")
+    control = {"priority": data["priority"]}
+    for field, key in fields.items():
+        control[key] = data[field]
+    if data.get("start_time") is not None:
+        # A time without a zone is HA local time; sent as UTC.
+        control["startTime"] = dt_util.as_utc(data["start_time"]).isoformat()
+    if data.get("duration") is not None:
+        control["duration"] = data["duration"]
+    return {"isDefault": data["is_default"], "controlId": data["control_id"], "controlType": ctype,
+            DER_TYPES[ctype]: control}
+
+
+def der_selection(data, der, body):
+    """Optional isDefault, controlType and controlId of a get or clear."""
+    if data.get("control_type") is not None:
+        if data["control_type"] not in der["control_types"]:
+            raise ServiceValidationError(
+                f"{data['control_type']} is not offered by the server DER policy "
+                f"({', '.join(der['control_types'])})")
+        body["controlType"] = data["control_type"]
+    if data.get("control_id") is not None:
+        body["controlId"] = data["control_id"]
+    return body
+
+
+def der_status(response):
+    """The station's status, or "CALLERROR <code>" for CitrineOS's CALLERROR object."""
+    if not isinstance(response, dict):
+        return None
+    if isinstance(response.get("_errorCode"), str):
+        return f"CALLERROR {response['_errorCode']}"
+    return response.get("status") if isinstance(response.get("status"), str) else None
+
+
+async def der_command(ctx, action, data=None):
+    """One DER service: validate, send on the policy's route, return the gateway reply."""
+    c = ctx["coordinator"]
+    client, s = await fresh(ctx)
+    try:
+        der = require_der(client)
+        sid = der["station_id"]
+        if action != "events":
+            # The gateway also answers 409; refusing here keeps an offline station off the wire.
+            if not c.last_update_success or not s.get("isOnline"):
+                raise HomeAssistantError(f"Fresh online evidence is required for {sid}")
+            if s.get("protocol") != PROTOCOL:
+                raise ServiceValidationError(f"DER control needs OCPP 2.1; {sid} is on {s.get('protocol')}")
+        if action == "set":
+            body = der_set_body(data, der)
+            response = await client.set_der_control(body)
+        elif action == "get":
+            request_id = data.get("request_id")
+            body = {"requestId": secrets.randbelow(DER_REQUEST_ID_MAX + 1) if request_id is None else request_id}
+            if data.get("is_default") is not None:
+                body["isDefault"] = data["is_default"]
+            body = der_selection(data, der, body)
+            response = await client.get_der_control(body)
+        elif action == "clear":
+            body = der_selection(data, der, {"isDefault": data["is_default"]})
+            response = await client.clear_der_control(body)
+        else:
+            return await client.der_events()
+    except CitrineApiError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        c.async_update_listeners()
+    return {"sent": body, "station_id": sid, "station_status": der_status(response),
+            "station_response": response}
 
 
 async def reconcile(ctx):
@@ -452,6 +580,48 @@ async def setup_lab(hass, entry, add_entities, platform):
                 vol.Optional("evse_id", default=0): vol.All(vol.Coerce(int), vol.Range(min=0)),
                 vol.Optional("intervals", default=48): vol.All(vol.Coerce(int), vol.Range(min=1, max=288)),
             }), supports_response=SupportsResponse.OPTIONAL)
+        der_types = vol.In(list(DER_TYPES))
+        control_id = vol.All(str, vol.Match(f"^{DER_CONTROL_ID.pattern}$"))
+        der_services = {
+            SERVICE_DER_SET: ("set", {
+                vol.Required("control_type"): der_types,
+                vol.Required("control_id"): control_id,
+                vol.Optional("is_default", default=False): cv.boolean,
+                vol.Optional("priority", default=1): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=2147483647)),
+                vol.Optional("pct_max_discharge_power"): vol.All(
+                    vol.Coerce(float), vol.Range(min=0, max=100)),
+                vol.Optional("displacement"): vol.All(
+                    vol.Coerce(float), vol.Range(min=0, max=1, min_included=False)),
+                vol.Optional("excitation"): cv.boolean,
+                vol.Optional("setpoint"): vol.All(vol.Coerce(float), vol.Range(min=-100, max=100)),
+                vol.Optional("unit"): vol.In(list(DER_UNITS)),
+                vol.Optional("start_time"): cv.datetime,
+                vol.Optional("duration"): vol.All(vol.Coerce(int), vol.Range(min=1, max=86400)),
+            }),
+            SERVICE_DER_GET: ("get", {
+                vol.Optional("request_id"): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=DER_REQUEST_ID_MAX)),
+                vol.Optional("is_default"): cv.boolean,
+                vol.Optional("control_type"): der_types,
+                vol.Optional("control_id"): control_id,
+            }),
+            SERVICE_DER_CLEAR: ("clear", {
+                vol.Required("is_default"): cv.boolean,
+                vol.Optional("control_type"): der_types,
+                vol.Optional("control_id"): control_id,
+            }),
+            SERVICE_DER_EVENTS: ("events", {}),
+        }
+        for name, (action, fields) in der_services.items():
+            if hass.services.has_service(DOMAIN, name):
+                continue
+
+            async def submit_der(call, action=action):
+                return await der_command(target(call), action, call.data)
+            hass.services.async_register(
+                DOMAIN, name, submit_der, schema=vol.Schema({vol.Required("entry_id"): str, **fields}),
+                supports_response=SupportsResponse.OPTIONAL)
         if not hass.services.has_service(DOMAIN, SERVICE_RECONCILE):
             async def reconcile_entry(call):
                 return await reconcile(target(call))

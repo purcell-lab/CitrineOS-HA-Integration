@@ -97,9 +97,9 @@ works as before.
 
 | Service | Message | Stations |
 | --- | --- | --- |
-| `citrine_ha.lab_schedule` + `price_entity` | TxProfile with `absolutePriceSchedule` (one rule stack per Amber interval, current first, up to `max_rule_stacks` and the next 24 h) | command station, OCPP 2.1 |
-| `citrine_ha.lab_cost_update` | `CostUpdated` with California Pricing `customData`: current price, the next interval as `nextPeriod`, and text such as "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" | command station, OCPP 2.1 or 2.0.1, active transaction |
-| `citrine_ha.lab_default_tariff` | `SetDefaultTariff`: Amber intervals as `energy.prices[]` with local start/end time of day and dates, priceKwh = Amber ÷ 1.1 (5 dp), GST 10 %; an optional feed-in sensor adds export entries (`minPower: -1, maxPower: -1000000`, priceKwh = −feed-in ÷ 1.1) | a station in `tariff_stations` (default the command station), OCPP 2.1 |
+| `citrine_ha.set_tx_profile` + `price_entity` | TxProfile with `absolutePriceSchedule` (one rule stack per Amber interval, current first, up to `max_rule_stacks` and the next 24 h) | command station, OCPP 2.1 |
+| `citrine_ha.cost_updated` | `CostUpdated` with California Pricing `customData`: current price, the next interval as `nextPeriod`, and text such as "Amber 22.5 c/kWh now, 20.2 c/kWh from 08:00" | command station, OCPP 2.1 or 2.0.1, active transaction |
+| `citrine_ha.set_default_tariff` | `SetDefaultTariff`: Amber intervals as `energy.prices[]` with local start/end time of day and dates, priceKwh = Amber ÷ 1.1 (5 dp), GST 10 %; an optional feed-in sensor adds export entries (`minPower: -1, maxPower: -1000000`, priceKwh = −feed-in ÷ 1.1) | a station in `tariff_stations` (default the command station), OCPP 2.1 |
 
 **OpenADR 3 VEN sensors (preferred).** A price sensor from the `openadr3_ven`
 integration (for example `sensor.openadr3_vtn_..._price` and `..._export_price`,
@@ -112,7 +112,7 @@ Amber sensors: the core `amberelectric` forecast sensors (`forecasts[]`) and
 price sensors (one current interval), and `amber_express`
 (`detailedForecast[]`, current price in the state). Past intervals and
 intervals with no price are skipped; negative prices are kept. The core
-forecast sensors list future intervals only, so `lab_cost_update` needs the
+forecast sensors list future intervals only, so `cost_updated` needs the
 core *price* sensor or `amber_express`. Price schedule fees are RationalNumbers
 with exponent −3 (0.1 c/kWh precision, AUD/kWh incl. GST). CostUpdated and
 tariff prices outside the server's bounds (−5 to 20 AUD/kWh) are clamped; the
@@ -123,7 +123,7 @@ Each service returns `sent` (a summary), `command_state` and, for a tariff,
 `station_status` (`Accepted`, `Rejected`, `CALLERROR NotImplemented`, ...)
 with the verbatim `station_response`. Price messages go through the same
 single-command path as the other lab commands: a timeout or 502 to 504 is
-`outcome_unknown` and needs `lab_reconcile` (a tariff 502 means CitrineOS did
+`outcome_unknown` and needs `reconcile_command_state` (a tariff 502 means CitrineOS did
 not send it, so it is `rejected`). Price features off, a non-2.1 station for a
 price schedule or tariff, no active transaction for a cost update, or a
 station outside `tariff_stations` fail with a validation error before
@@ -136,12 +136,12 @@ triggers:
   - trigger: state
     entity_id: sensor.openadr3_vtn_example_price
 actions:
-  - action: citrine_ha.lab_cost_update
+  - action: citrine_ha.cost_updated
     continue_on_error: true   # no active transaction is a validation error
     data:
       entry_id: "<the isolated CitrineOS entry ID>"
       price_entity: sensor.openadr3_vtn_example_price
-  - action: citrine_ha.lab_default_tariff
+  - action: citrine_ha.set_default_tariff
     data:
       entry_id: "<the isolated CitrineOS entry ID>"
       price_entity: sensor.openadr3_vtn_example_price
@@ -156,7 +156,7 @@ actions:
 A schedule with the forecast attached as an absolutePriceSchedule:
 
 ```yaml
-action: citrine_ha.lab_schedule
+action: citrine_ha.set_tx_profile
 data:
   entry_id: "<the isolated CitrineOS entry ID>"
   immediate: true
@@ -165,6 +165,52 @@ data:
   periods:
     - {startPeriod: 0, limit: 11000, dischargeLimit: -11000, setpoint: 6000, operationMode: CentralSetpoint}
 response_variable: schedule   # schedule.sent.price_schedule: id, rule stacks, horizon
+```
+
+---
+
+## DER control (0.7.0, scoped lab profile)
+
+OCPP 2.1 DER control messages to the command station, through the CitrineOS
+Isolated Lab App 0.10.0 DER routes (`der_commands_enabled`, which needs
+`command_control_enabled`). The services are available only while
+`/lab/control-policy` reports `der_commands` enabled with exactly the known
+routes and the command station; when the key is missing, disabled or
+malformed, DER controls are off and everything else works as before. Requests
+go only to the routes the policy names, with the command token.
+
+| Service | Message | Fields |
+| --- | --- | --- |
+| `citrine_ha.set_der_control` | `SetDERControl` with exactly one control matching `control_type` | `control_type`, `control_id`, `is_default` (false), `priority` (1), the type's fields, optional `start_time` and `duration` (s) |
+| `citrine_ha.get_der_control` | `GetDERControl`; the reply carries the `ReportDERControl` reports for the request ID | optional `request_id` (random when empty), `is_default`, `control_type`, `control_id` |
+| `citrine_ha.clear_der_control` | `ClearDERControl` | `is_default` (required), optional `control_type`, `control_id` |
+| `citrine_ha.get_der_events` | `GET /lab/der-events`: the newest 20 DER reports and notifications | none |
+
+| `control_type` | Fields (all required for the type, no others) |
+| --- | --- |
+| `LimitMaxDischarge` | `pct_max_discharge_power` (0 to 100 %) |
+| `FixedPFInject`, `FixedPFAbsorb` | `displacement` (above 0, at most 1), `excitation` |
+| `FixedVar` | `setpoint` (-100 to 100 %), `unit` (`PctMaxW`, `PctMaxVar`, `PctVarAvail`) |
+
+Missing or extra fields for the type, values outside the policy's `limits`, a
+control type the policy does not offer, or a command station that is offline
+or not on OCPP 2.1 fail with a validation error before anything is sent. The
+set, get and clear services return `sent`, `station_status` (`Accepted`,
+`Rejected`, `NotSupported`, `NotFound` or `CALLERROR ...`) and the verbatim
+`station_response`. Gateway errors come back with the gateway's error text; a
+502 (not sent) or 504 (no station reply in 8 s) means the outcome may be
+unknown: check with `get_der_control` and do not retry automatically. DER
+messages do not change the command state that Start, Stop and schedules use.
+
+```yaml
+action: citrine_ha.set_der_control
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+  control_type: LimitMaxDischarge
+  control_id: lab-limit-1
+  pct_max_discharge_power: 50
+  duration: 3600
+response_variable: der   # der.station_status, der.station_response.supersededIds
 ```
 
 ---

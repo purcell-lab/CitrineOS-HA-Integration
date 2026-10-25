@@ -63,10 +63,10 @@ the EV's ChargingNeeds limit and the EVSE rating, else the fallback option. They
 stay available while the station is offline; see the README's "Station power
 limits".
 
-`citrine_ha.lab_schedule` submits a multi-period schedule:
+`citrine_ha.set_tx_profile` submits a multi-period schedule:
 
 ```yaml
-action: citrine_ha.lab_schedule
+action: citrine_ha.set_tx_profile
 data:
   entry_id: "<the isolated CitrineOS entry ID>"
   duration: 240
@@ -122,7 +122,7 @@ every command except Stop until reconciled. Press **Reconcile command state**
 or call:
 
 ```yaml
-action: citrine_ha.lab_reconcile
+action: citrine_ha.reconcile_command_state
 data:
   entry_id: "<the isolated CitrineOS entry ID>"
 response_variable: reconcile   # optional: the resolved command state
