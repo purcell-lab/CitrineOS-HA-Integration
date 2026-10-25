@@ -57,13 +57,13 @@ def test_v2_station_database_identity_is_not_command_identity():
     assert rows["connectors"][0]["connectorId"] == 2
 
 
-@pytest.mark.parametrize("failure", ["tenant", "missing", "duplicate", "orphan", "evse", "bound"])
+@pytest.mark.parametrize("failure", ["tenant", "missing_id", "duplicate", "orphan", "evse", "bound"])
 def test_v2_rejects_unsafe_discovery(failure):
     data = discovery()
     if failure == "tenant":
         data["data"]["Connectors"][0]["tenantId"] = 2
-    elif failure == "missing":
-        del data["data"]["ChargingStations"][0]["ocppConnectionName"]
+    elif failure == "missing_id":
+        del data["data"]["ChargingStations"][0]["id"]
     elif failure == "duplicate":
         data["data"]["ChargingStations"] *= 2
     elif failure == "orphan":
@@ -73,6 +73,45 @@ def test_v2_rejects_unsafe_discovery(failure):
     else:
         data["data"]["Connectors"] *= 501
     with pytest.raises(ValueError):
+        normalize_v2_discovery(data, 1)
+
+
+def unnamed_station(name):
+    """discovery() plus station 43, whose connection name is unusable, with its own children."""
+    data = discovery()
+    row = {"id": 43, "tenantId": 1, "protocol": "ocpp2.1", "isOnline": False}
+    if name is not None:
+        row["ocppConnectionName"] = name
+    data["data"]["ChargingStations"].append(row)
+    data["data"]["Connectors"].append(
+        {"id": 9, "stationId": 43, "tenantId": 1, "connectorId": 1, "evseId": 8,
+         "evseTypeConnectorId": 1, "status": "Available",
+         "Evse": {"id": 8, "stationId": 43, "tenantId": 1, "evseTypeId": 1}})
+    data["data"]["Transactions"].append(
+        {"id": 92, "stationId": 43, "tenantId": 1, "transactionId": "tx-2", "isActive": True})
+    return data
+
+
+@pytest.mark.parametrize("name", [None, "", "   "])
+def test_v2_skips_station_without_connection_name(name, caplog):
+    rows = normalize_v2_discovery(unnamed_station(name), 1)
+    assert [s["id"] for s in rows["stations"]] == ["SIM-CITRINE-LAB-01"]
+    assert [c["databaseStationId"] for c in rows["connectors"]] == [42]
+    assert [t["databaseStationId"] for t in rows["transactions"]] == [42]
+    assert "Skipping CitrineOS station 43: no OCPP connection name" in caplog.text
+
+
+def test_v2_skips_every_station_sharing_a_connection_name(caplog):
+    data = unnamed_station("SIM-CITRINE-LAB-01")
+    rows = normalize_v2_discovery(data, 1)
+    assert rows == {"stations": [], "connectors": [], "transactions": []}
+    assert caplog.text.count("is used by 2 stations") == 2
+
+
+def test_v2_child_of_unknown_station_still_rejected_beside_skipped_one():
+    data = unnamed_station("")
+    data["data"]["Transactions"][0]["stationId"] = 77
+    with pytest.raises(ValueError, match="Unresolved station relationship"):
         normalize_v2_discovery(data, 1)
 
 
