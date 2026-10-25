@@ -217,6 +217,118 @@
           "description": "Amber intervals per forecast, limited by the App's max_prices."
         }
       }
+    },
+    "lab_set_der_control": {
+      "name": "Set scoped lab DER control",
+      "description": "Send SetDERControl (OCPP 2.1) with one control of the chosen type to the command station.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "control_type": {
+          "name": "Control type",
+          "description": "LimitMaxDischarge, FixedPFInject, FixedPFAbsorb or FixedVar."
+        },
+        "control_id": {
+          "name": "Control ID",
+          "description": "1 to 36 characters: letters, digits and . _ : -"
+        },
+        "is_default": {
+          "name": "Default control",
+          "description": "Set the station's default control instead of a scheduled one."
+        },
+        "priority": {
+          "name": "Priority",
+          "description": "0 is the highest priority."
+        },
+        "pct_max_discharge_power": {
+          "name": "Max discharge power",
+          "description": "LimitMaxDischarge only: percent of the station's maximum discharge power."
+        },
+        "displacement": {
+          "name": "Displacement",
+          "description": "FixedPFInject and FixedPFAbsorb only: power factor, above 0 and at most 1."
+        },
+        "excitation": {
+          "name": "Excitation",
+          "description": "FixedPFInject and FixedPFAbsorb only: true for over-excited."
+        },
+        "setpoint": {
+          "name": "Setpoint",
+          "description": "FixedVar only: reactive power, -100 to 100 percent of unit."
+        },
+        "unit": {
+          "name": "Unit",
+          "description": "FixedVar only: PctMaxW, PctMaxVar or PctVarAvail."
+        },
+        "start_time": {
+          "name": "Start time",
+          "description": "Optional; local time unless a time zone is given."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Optional, 1 to 86400 seconds (the App's max_duration_s)."
+        }
+      }
+    },
+    "lab_get_der_control": {
+      "name": "Get scoped lab DER controls",
+      "description": "Send GetDERControl (OCPP 2.1) to the command station and return the reports for the request.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "request_id": {
+          "name": "Request ID",
+          "description": "Optional; a random ID when empty."
+        },
+        "is_default": {
+          "name": "Default controls",
+          "description": "Only default (true) or only scheduled (false) controls; empty for both."
+        },
+        "control_type": {
+          "name": "Control type",
+          "description": "Only this control type."
+        },
+        "control_id": {
+          "name": "Control ID",
+          "description": "Only this control."
+        }
+      }
+    },
+    "lab_clear_der_control": {
+      "name": "Clear scoped lab DER controls",
+      "description": "Send ClearDERControl (OCPP 2.1) to the command station.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "is_default": {
+          "name": "Default controls",
+          "description": "Clear default (true) or scheduled (false) controls."
+        },
+        "control_type": {
+          "name": "Control type",
+          "description": "Only this control type."
+        },
+        "control_id": {
+          "name": "Control ID",
+          "description": "Only this control."
+        }
+      }
+    },
+    "lab_der_events": {
+      "name": "Read scoped lab DER events",
+      "description": "Return the command station's newest DER reports and notifications, at most 20.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        }
+      }
     }
   }
 }

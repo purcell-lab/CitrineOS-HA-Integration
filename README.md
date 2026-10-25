@@ -169,6 +169,52 @@ response_variable: schedule   # schedule.sent.price_schedule: id, rule stacks, h
 
 ---
 
+## DER control (0.7.0, scoped lab profile)
+
+OCPP 2.1 DER control messages to the command station, through the CitrineOS
+Isolated Lab App 0.10.0 DER routes (`der_commands_enabled`, which needs
+`command_control_enabled`). The services are available only while
+`/lab/control-policy` reports `der_commands` enabled with exactly the known
+routes and the command station; when the key is missing, disabled or
+malformed, DER controls are off and everything else works as before. Requests
+go only to the routes the policy names, with the command token.
+
+| Service | Message | Fields |
+| --- | --- | --- |
+| `citrine_ha.lab_set_der_control` | `SetDERControl` with exactly one control matching `control_type` | `control_type`, `control_id`, `is_default` (false), `priority` (1), the type's fields, optional `start_time` and `duration` (s) |
+| `citrine_ha.lab_get_der_control` | `GetDERControl`; the reply carries the `ReportDERControl` reports for the request ID | optional `request_id` (random when empty), `is_default`, `control_type`, `control_id` |
+| `citrine_ha.lab_clear_der_control` | `ClearDERControl` | `is_default` (required), optional `control_type`, `control_id` |
+| `citrine_ha.lab_der_events` | `GET /lab/der-events`: the newest 20 DER reports and notifications | none |
+
+| `control_type` | Fields (all required for the type, no others) |
+| --- | --- |
+| `LimitMaxDischarge` | `pct_max_discharge_power` (0 to 100 %) |
+| `FixedPFInject`, `FixedPFAbsorb` | `displacement` (above 0, at most 1), `excitation` |
+| `FixedVar` | `setpoint` (-100 to 100 %), `unit` (`PctMaxW`, `PctMaxVar`, `PctVarAvail`) |
+
+Missing or extra fields for the type, values outside the policy's `limits`, a
+control type the policy does not offer, or a command station that is offline
+or not on OCPP 2.1 fail with a validation error before anything is sent. The
+set, get and clear services return `sent`, `station_status` (`Accepted`,
+`Rejected`, `NotSupported`, `NotFound` or `CALLERROR ...`) and the verbatim
+`station_response`. Gateway errors come back with the gateway's error text; a
+502 (not sent) or 504 (no station reply in 8 s) means the outcome may be
+unknown: check with `lab_get_der_control` and do not retry automatically. DER
+messages do not change the command state that Start, Stop and schedules use.
+
+```yaml
+action: citrine_ha.lab_set_der_control
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+  control_type: LimitMaxDischarge
+  control_id: lab-limit-1
+  pct_max_discharge_power: 50
+  duration: 3600
+response_variable: der   # der.station_status, der.station_response.supersededIds
+```
+
+---
+
 ## Station power limits (0.6.2)
 
 Every discovered station gets two read-only sensors in W (device class power,
