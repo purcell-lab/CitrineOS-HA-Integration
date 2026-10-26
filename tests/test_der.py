@@ -1,4 +1,5 @@
 """OCPP 2.1 DER control: der_commands policy, client routes and the four services."""
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -122,6 +123,18 @@ async def test_client_routes_and_verbatim_replies():
     assert c._command_client._request.call_args_list[-1].args == ("GET", DER_EVENTS)
     # DER messages never replace the Start/Stop/profile outcome.
     assert c.last_command == {"state": "not_sent"}
+
+
+@pytest.mark.asyncio
+async def test_der_message_waits_for_a_command_in_flight():
+    c = client(); await c.control_policy()
+    await c._command_lock.acquire()
+    pending = asyncio.create_task(c.set_der_control(set_body()))
+    await asyncio.sleep(0.01)
+    assert c.posts == [] and not pending.done()
+    c._command_lock.release()
+    assert await pending == {"status": "Accepted"}
+    assert c.posts == [(DER_ROUTES["set"], PARAMS, set_body())]
 
 
 @pytest.mark.parametrize("body", [

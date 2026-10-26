@@ -289,6 +289,16 @@ it). Attributes: `source`, `evse_id`, `local_generation`, `grid_critical`,
 interval, at most every 25 s) and right after the services above; the sensor
 is unavailable while the read fails.
 
+**One command at a time.** The lab sends one command to the CSMS at a time:
+Start, Stop, `set_tx_profile`, the price messages, DER messages and the local
+energy services all share one slot. A command that finds another in flight
+waits up to 20 s for it to return, then runs its own checks against the state
+the first one left (an unresolved outcome still blocks it). Only after 20 s
+does it fail with "A lab command is still in progress after 20 s; nothing was
+sent". Nothing has been sent at that point, so the wait never resends a
+command. A transaction start that fires the schedule bridge, CostUpdated and
+SetDefaultTariff together therefore sends all three in turn.
+
 ---
 
 ## Station power limits (0.6.2)

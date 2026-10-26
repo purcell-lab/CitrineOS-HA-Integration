@@ -7,6 +7,7 @@ use the station's observed OCPP version: 2.1, or charging-only 2.0.1 or 1.6.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from copy import deepcopy
 import logging
 from datetime import UTC, datetime, timedelta
@@ -47,6 +48,10 @@ PROFILE_ID = 9001
 # no_station_evidence (a new Start is then allowed). Reconcile also waits this
 # long after dispatch, so a command that may still land is never discarded.
 EVIDENCE_TIMEOUT_S = 90
+# A command that finds another in flight waits this long for it to return
+# instead of failing at once. Only the slot is awaited: nothing has been sent
+# yet, so this never resends a command.
+COMMAND_WAIT_S = 20
 # States that block every command except Stop until reconciled.
 UNRESOLVED = ("outcome_unknown", "dispatch_not_confirmed")
 AWAITING = "dispatched_awaiting_station_evidence"
@@ -643,6 +648,19 @@ class ScopedLabClient(CitrineClient):
                                          observed_at=datetime.now(UTC).isoformat())
         self.expire_awaiting(now)
 
+    @asynccontextmanager
+    async def _command_slot(self):
+        """Hold the command lock, waiting up to COMMAND_WAIT_S for a command in flight."""
+        try:
+            await asyncio.wait_for(self._command_lock.acquire(), COMMAND_WAIT_S)
+        except TimeoutError:
+            raise CitrineApiError(
+                f"A lab command is still in progress after {COMMAND_WAIT_S} s; nothing was sent") from None
+        try:
+            yield
+        finally:
+            self._command_lock.release()
+
     async def reconcile(self, station, now=None):
         """Resolve an unresolved or awaiting outcome from freshly read CSMS state.
 
@@ -789,28 +807,26 @@ class ScopedLabClient(CitrineClient):
         elif protocol not in self.protocols or station_id != self.station:
             raise CitrineCompatibilityError(
                 "The enrolled command station on an observed protocol the server accepts is required")
-        if self._command_lock.locked():
-            raise CitrineApiError("A lab command is already in progress")
-        self.require_csms()
-        self.expire_awaiting()
-        if action != "stop" and self.last_command.get("state") in UNRESOLVED:
-            raise CitrineApiError(
-                "Previous outcome unresolved; reconcile before further commands "
-                "(citrine_ha.reconcile_command_state or the Reconcile command state button)")
-        if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == AWAITING:
-            remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
-            raise CitrineApiError(
-                f"Start already dispatched; wait up to {remaining} s for the transaction instead of retrying")
-        if (price and self.last_command.get("action") in ("start", "stop")
-                and self.last_command.get("state") == AWAITING):
-            # A price message would replace the Start/Stop evidence being awaited.
-            remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
-            raise CitrineApiError(
-                f"A {self.last_command['action']} awaits station evidence; send prices after it "
-                f"resolves (up to {remaining} s)")
-        # Translate before any state change, so an untranslatable command is refused cleanly.
-        body = to_ocpp16(action, payload) if protocol == "ocpp1.6" else payload
-        async with self._command_lock:
+        async with self._command_slot():
+            self.require_csms()
+            self.expire_awaiting()
+            if action != "stop" and self.last_command.get("state") in UNRESOLVED:
+                raise CitrineApiError(
+                    "Previous outcome unresolved; reconcile before further commands "
+                    "(citrine_ha.reconcile_command_state or the Reconcile command state button)")
+            if action == "start" and self.last_command.get("action") == "start" and self.last_command.get("state") == AWAITING:
+                remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
+                raise CitrineApiError(
+                    f"Start already dispatched; wait up to {remaining} s for the transaction instead of retrying")
+            if (price and self.last_command.get("action") in ("start", "stop")
+                    and self.last_command.get("state") == AWAITING):
+                # A price message would replace the Start/Stop evidence being awaited.
+                remaining = max(1, round(self.evidence_timeout - (self._age() or 0)))
+                raise CitrineApiError(
+                    f"A {self.last_command['action']} awaits station evidence; send prices after it "
+                    f"resolves (up to {remaining} s)")
+            # Translate before any state change, so an untranslatable command is refused cleanly.
+            body = to_ocpp16(action, payload) if protocol == "ocpp1.6" else payload
             # Fail fast, before any state change, while the CSMS is restarting.
             await self._csms_call(self.ready())
             policy = await self._csms_call(self.control_policy())
@@ -965,10 +981,8 @@ class ScopedLabClient(CitrineClient):
         if self.read_only:
             raise CitrineReadOnlyError("Lab controls are disabled")
         self.require_der()
-        if self._command_lock.locked():
-            raise CitrineApiError("A lab command is already in progress")
         self.require_csms()
-        async with self._command_lock:
+        async with self._command_slot():
             await self._csms_call(self.ready())
             await self._csms_call(self.control_policy())
             self._csms_recovered()
@@ -1037,10 +1051,8 @@ class ScopedLabClient(CitrineClient):
             raise CitrineReadOnlyError("Lab controls are disabled")
         part = "charging_limits" if action == "limits" else "local_generation"
         self.require_local(part)
-        if self._command_lock.locked():
-            raise CitrineApiError("A lab command is already in progress")
         self.require_csms()
-        async with self._command_lock:
+        async with self._command_slot():
             await self._csms_call(self.ready())
             await self._csms_call(self.control_policy())
             self._csms_recovered()
