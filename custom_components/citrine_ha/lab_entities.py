@@ -16,9 +16,10 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .citrine_api import CitrineApiError
-from .lab_control import (DER_CONTROL_ID, DER_REQUEST_ID_MAX, DER_TYPES, DER_UNITS, PROFILE_ID, PROTOCOL,
-                          MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient, power_period,
-                          number)
+from .lab_control import (BASE_MODES, DER_CONTROL_ID, DER_REQUEST_ID_MAX, DER_TYPES, DER_UNITS,
+                          LOCAL_MAX_DURATION_S, LOCAL_MODES, LOCAL_PROFILE_ID, LOCAL_PURPOSE, PROFILE_ID,
+                          PROTOCOL, MAX_EXPORT_W, MAX_IMPORT_W, STATION_PATTERN, ScopedLabClient,
+                          charging_limit_now, local_modes, power_period, number)
 from .power_limits import CHARGE, DISCHARGE, sensor_state
 from .pricing import (TOTAL_COST_MAX, amber_intervals, build_cost_updated, build_price_schedule,
                       build_tariff, current_and_next, openadr_forecasts, schedule_summary,
@@ -32,6 +33,9 @@ SERVICE_DER_SET = "set_der_control"
 SERVICE_DER_GET = "get_der_control"
 SERVICE_DER_CLEAR = "clear_der_control"
 SERVICE_DER_EVENTS = "get_der_events"
+SERVICE_LOCAL_SET = "set_local_generation_profile"
+SERVICE_LOCAL_CLEAR = "clear_local_generation_profile"
+SERVICE_LIMITS = "get_charging_limits"
 # Service field -> OCPP key: the fields each controlType's control carries.
 DER_COMMON = {"priority": "priority", "start_time": "startTime", "duration": "duration"}
 DER_FIELDS = {
@@ -143,6 +147,9 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False, p
     tx = s.get("activeTransactionId")
     sent = None
     try:
+        if periods is not None:
+            # The fresh policy decides which bounded local modes a period may use.
+            check_local_periods(periods, client.local_energy)
         if action == "start":
             if tx:
                 raise HomeAssistantError("The simulator already has an active transaction")
@@ -183,6 +190,42 @@ async def command(ctx, action, *, periods=None, duration=180, immediate=False, p
     finally:
         c.async_update_listeners()
     return result(client, sent)
+
+
+def check_local_periods(periods, local):
+    """ExternalLimits, ExternalSetpoint and LocalLoadBalancing periods, checked before sending.
+
+    Each needs the server's local_energy policy to list the mode, a limit
+    (0 to 25 kW) and a dischargeLimit (-25 kW to 0), and no setpoint. Every
+    other period is left to the existing CentralSetpoint and charging-only checks.
+    """
+    offered = local_modes(local)
+    for index, p in enumerate(periods if isinstance(periods, list) else []):
+        mode = p.get("operationMode") if isinstance(p, dict) else None
+        if mode not in LOCAL_MODES:
+            continue
+        where = f"Period {index} ({mode})"
+        if mode not in offered:
+            raise ServiceValidationError(
+                f"{where}: {mode} is not offered by the server policy (offered: "
+                f"{', '.join((*BASE_MODES, *offered))})"
+                + ("; its local_energy policy is malformed" if local.get("invalid") else ""))
+        if "setpoint" in p:
+            raise ServiceValidationError(
+                f"{where}: no setpoint is allowed; the station or a local EMS chooses the power "
+                "within limit and dischargeLimit")
+        missing = [k for k in ("limit", "dischargeLimit") if p.get(k) is None]
+        if missing:
+            raise ServiceValidationError(f"{where}: {' and '.join(missing)} required")
+        extra = sorted(set(p) - {"startPeriod", "limit", "dischargeLimit", "operationMode"})
+        if extra:
+            raise ServiceValidationError(
+                f"{where}: takes only startPeriod, limit, dischargeLimit and operationMode "
+                f"(not {', '.join(extra)})")
+        if not number(p["limit"], 0, MAX_IMPORT_W):
+            raise ServiceValidationError(f"{where}: limit must be 0 to {MAX_IMPORT_W} W")
+        if not number(p["dischargeLimit"], -MAX_EXPORT_W, 0):
+            raise ServiceValidationError(f"{where}: dischargeLimit must be -{MAX_EXPORT_W} to 0 W")
 
 
 async def cost_update(ctx, state, *, total_cost=0, tz=UTC):
@@ -361,6 +404,109 @@ async def der_command(ctx, action, data=None):
             "station_response": response}
 
 
+def require_local(client, part):
+    local = client.local_energy
+    if not local.get("enabled") or not local.get(part):
+        raise ServiceValidationError(
+            f"Local energy {part} is not offered: the CitrineOS server policy has no local_energy."
+            f"{part} (CitrineOS Isolated Lab App 0.11.0)"
+            + ("; its local_energy policy is malformed" if local.get("invalid") else ""))
+    return local
+
+
+def watts(value):
+    """A limit as a whole number of W when it is one."""
+    return int(value) if float(value).is_integer() else value
+
+
+def local_generation_body(data, lg):
+    """SetChargingProfile with one LocalGeneration schedule, inside the policy's local_generation.
+
+    start_time given: Absolute from that time (sent as UTC); absent: Relative.
+    """
+    evse_id, profile_id, duration = data["evse_id"], data["profile_id"], data["duration"]
+    low, high = lg["ids"]
+    if evse_id not in lg["evse_ids"]:
+        raise ServiceValidationError(
+            f"evse_id must be one of {', '.join(map(str, lg['evse_ids']))} (server local_generation policy)")
+    if not low <= profile_id <= high:
+        raise ServiceValidationError(f"profile_id must be {low} to {high} (server local_generation policy)")
+    if not 1 <= duration <= lg["max_duration_s"]:
+        raise ServiceValidationError(f"duration must be 1 to {lg['max_duration_s']} s")
+    periods = data.get("periods") or []
+    if not 1 <= len(periods) <= lg["max_periods"]:
+        raise ServiceValidationError(f"periods must hold 1 to {lg['max_periods']} periods")
+    out, last = [], -1
+    for index, p in enumerate(periods):
+        start = p["start_period"]
+        if index == 0 and start != 0:
+            raise ServiceValidationError("The first period must have start_period 0")
+        if start <= last:
+            raise ServiceValidationError(
+                f"Period {index}: start_period {start} must be after the previous ({last})")
+        if start >= duration:
+            raise ServiceValidationError(f"Period {index}: start_period {start} must be below duration {duration}")
+        if not number(p["limit"], 0, MAX_IMPORT_W):
+            raise ServiceValidationError(f"Period {index}: limit must be 0 to {MAX_IMPORT_W} W")
+        period = {"startPeriod": start, "limit": watts(p["limit"])}
+        if p.get("number_phases") is not None:
+            period["numberPhases"] = p["number_phases"]
+        out.append(period)
+        last = start
+    schedule = {"id": profile_id}
+    absolute = data.get("start_time") is not None
+    if absolute:
+        # A time without a zone is HA local time; sent as UTC.
+        schedule["startSchedule"] = dt_util.as_utc(data["start_time"]).isoformat()
+    schedule.update(duration=duration, chargingRateUnit="W", chargingSchedulePeriod=out)
+    return {"evseId": evse_id, "chargingProfile": {
+        "id": profile_id, "stackLevel": data["stack_level"], "chargingProfilePurpose": LOCAL_PURPOSE,
+        "chargingProfileKind": "Absolute" if absolute else "Relative", "chargingSchedule": [schedule]}}
+
+
+def send_status(response):
+    """The station's status or CALLERROR, else "dispatched" for CitrineOS's send confirmation."""
+    status = der_status(response)
+    if status is None and isinstance(response, list):
+        # The native API confirms the message was sent, not the station's CALLRESULT.
+        return "dispatched"
+    return status
+
+
+async def local_command(ctx, action, data=None):
+    """One local energy service: validate, send to the command station, return the gateway reply."""
+    c = ctx["coordinator"]
+    client, s = await fresh(ctx)
+    sid = client.station
+    try:
+        if action == "limits":
+            require_local(client, "charging_limits")
+            return await client.get_charging_limits()
+        lg = require_local(client, "local_generation")["local_generation"]
+        # The gateway also answers 409; refusing here keeps an offline station off the wire.
+        if not c.last_update_success or not s.get("isOnline"):
+            raise HomeAssistantError(f"Fresh online evidence is required for {sid}")
+        if s.get("protocol") != PROTOCOL:
+            raise ServiceValidationError(f"{LOCAL_PURPOSE} profiles need OCPP 2.1; {sid} is on {s.get('protocol')}")
+        if action == "set":
+            body = local_generation_body(data, lg)
+            response = await client.set_local_generation_profile(body)
+        else:
+            low, high = lg["ids"]
+            if not low <= data["profile_id"] <= high:
+                raise ServiceValidationError(f"profile_id must be {low} to {high} (server local_generation policy)")
+            body = {"chargingProfileId": data["profile_id"]}
+            response = await client.clear_local_generation_profile(data["profile_id"])
+        # The station may now report a changed limit.
+        await client.poll_charging_limits(force=True)
+    except CitrineApiError as err:
+        raise HomeAssistantError(str(err)) from err
+    finally:
+        c.async_update_listeners()
+    return {"sent": body, "station_id": sid, "station_status": send_status(response),
+            "station_response": response}
+
+
 async def reconcile(ctx):
     """Re-read the CSMS now and resolve an unresolved or awaiting command outcome."""
     c = ctx["coordinator"]
@@ -512,6 +658,32 @@ class LabMaxPowerSensor(LabEntity, SensorEntity):
                             self.coordinator.default_max_power_w)[1]
 
 
+class LabChargingLimitSensor(LabEntity, SensorEntity):
+    """The EMS or other external charging limit in effect now on the command station."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_translation_key = "ems_charging_limit"
+    _attr_icon = "mdi:transmission-tower-import"
+
+    def __init__(self, ctx, entry):
+        super().__init__(ctx, entry, "ems_charging_limit", "EMS charging limit")
+
+    @property
+    def available(self):
+        # A limit read from the gateway, not a station measurement: offline stations keep it.
+        return CoordinatorEntity.available.fget(self) and self.ctx["client"].charging_limits is not None
+
+    @property
+    def native_value(self):
+        return charging_limit_now(self.ctx["client"].charging_limits)[0]
+
+    @property
+    def extra_state_attributes(self):
+        return charging_limit_now(self.ctx["client"].charging_limits)[1]
+
+
 def max_power_sensors(ctx, entry, known):
     """Max discharge and charge power sensors for stations not yet known."""
     entities = []
@@ -622,6 +794,36 @@ async def setup_lab(hass, entry, add_entities, platform):
             hass.services.async_register(
                 DOMAIN, name, submit_der, schema=vol.Schema({vol.Required("entry_id"): str, **fields}),
                 supports_response=SupportsResponse.OPTIONAL)
+        local_services = {
+            SERVICE_LOCAL_SET: ("set", {
+                vol.Optional("evse_id", default=0): vol.All(vol.Coerce(int), vol.In([0, 1])),
+                vol.Optional("profile_id", default=LOCAL_PROFILE_ID): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=2147483647)),
+                vol.Optional("stack_level", default=1): vol.All(vol.Coerce(int), vol.Range(min=0, max=10)),
+                vol.Optional("start_time"): cv.datetime,
+                vol.Optional("duration", default=LOCAL_MAX_DURATION_S): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=LOCAL_MAX_DURATION_S)),
+                vol.Required("periods"): vol.All([vol.Schema({
+                    vol.Required("start_period"): vol.All(vol.Coerce(int), vol.Range(min=0)),
+                    vol.Required("limit"): vol.All(vol.Coerce(float), vol.Range(min=0, max=MAX_IMPORT_W)),
+                    vol.Optional("number_phases"): vol.All(vol.Coerce(int), vol.In([1, 3])),
+                })], vol.Length(min=1)),
+            }),
+            SERVICE_LOCAL_CLEAR: ("clear", {
+                vol.Optional("profile_id", default=LOCAL_PROFILE_ID): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=2147483647)),
+            }),
+            SERVICE_LIMITS: ("limits", {}),
+        }
+        for name, (action, fields) in local_services.items():
+            if hass.services.has_service(DOMAIN, name):
+                continue
+
+            async def submit_local(call, action=action):
+                return await local_command(target(call), action, call.data)
+            hass.services.async_register(
+                DOMAIN, name, submit_local, schema=vol.Schema({vol.Required("entry_id"): str, **fields}),
+                supports_response=SupportsResponse.OPTIONAL)
         if not hass.services.has_service(DOMAIN, SERVICE_RECONCILE):
             async def reconcile_entry(call):
                 return await reconcile(target(call))
@@ -641,6 +843,10 @@ async def setup_lab(hass, entry, add_entities, platform):
             ("status", "Connector status", None),
             ("command", "Command dispatch status", None),
         )])
+        client = ctx["client"]
+        if (isinstance(client, ScopedLabClient) and not client.read_only
+                and client.local_energy.get("charging_limits")):
+            add_entities([LabChargingLimitSensor(ctx, entry)])
         # Every discovered station, not only the command station.
         known = set()
         add_entities(max_power_sensors(ctx, entry, known))

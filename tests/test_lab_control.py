@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 import json
@@ -9,6 +10,7 @@ import pytest
 
 from custom_components.citrine_ha.citrine_api import CitrineApiError, CitrineCompatibilityError, CitrineHttpError, CitrineReadOnlyError
 from custom_components.citrine_ha.compatibility import PROFILE_LAB, automatic_control_disabled
+from custom_components.citrine_ha import lab_control
 from custom_components.citrine_ha.lab_control import ScopedLabClient, STATION, PROTOCOL, PATHS, build_profile, power_period, charge_period, paths_for, transaction, to_ocpp16
 from custom_components.citrine_ha.lab_telemetry import parse_meter
 from custom_components.citrine_ha.lab_entities import setup_lab, command
@@ -161,6 +163,58 @@ async def test_ambiguous_dispatch_response_is_not_success(response):
 async def _profile(c):
     return await c.submit_schedule(protocol=PROTOCOL, station_id=STATION, transaction_id="t",
                                    periods=[charge_period(0, 7000, 3)], immediate=True)
+
+
+def _gated(c, result=None):
+    """The command transport waits on the returned event before it answers."""
+    gate=asyncio.Event()
+    async def send(*args, **kwargs):
+        await gate.wait()
+        if isinstance(result, Exception):
+            raise result
+        return [{"success":True}]
+    c._command_client._request=AsyncMock(side_effect=send)
+    return gate
+
+
+@pytest.mark.asyncio
+async def test_command_waits_for_one_in_flight_then_sends():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    gate=_gated(c)
+    first=asyncio.create_task(_profile(c));await asyncio.sleep(0.01)
+    second=asyncio.create_task(_profile(c));await asyncio.sleep(0.01)
+    assert c._command_client._request.await_count==1 and not second.done()
+    gate.set()
+    await first
+    assert (await second)["state"]=="dispatched_awaiting_station_evidence"
+    assert c._command_client._request.await_count==2
+
+
+@pytest.mark.asyncio
+async def test_command_wait_is_bounded_and_sends_nothing(monkeypatch):
+    monkeypatch.setattr(lab_control, "COMMAND_WAIT_S", 0.05)
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    gate=_gated(c)
+    first=asyncio.create_task(_profile(c));await asyncio.sleep(0.01)
+    with pytest.raises(CitrineApiError, match="still in progress after 0.05 s; nothing was sent"):
+        await _profile(c)
+    assert c._command_client._request.await_count==1
+    gate.set();await first
+
+
+@pytest.mark.asyncio
+async def test_waiting_command_honours_the_outcome_the_first_left():
+    c=client();c.control_policy=AsyncMock(return_value=policy())
+    gate=_gated(c, CitrineApiError("transport lost"))
+    first=asyncio.create_task(_profile(c));await asyncio.sleep(0.01)
+    second=asyncio.create_task(_profile(c));await asyncio.sleep(0.01)
+    gate.set()
+    with pytest.raises(CitrineApiError, match="transport lost"):
+        await first
+    with pytest.raises(CitrineApiError, match="Previous outcome unresolved"):
+        await second
+    assert c.last_command["state"]=="outcome_unknown"
+    assert c._command_client._request.await_count==1
 
 
 @pytest.mark.asyncio

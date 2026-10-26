@@ -1,4 +1,5 @@
 """OCPP 2.1 DER control: der_commands policy, client routes and the four services."""
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -122,6 +123,18 @@ async def test_client_routes_and_verbatim_replies():
     assert c._command_client._request.call_args_list[-1].args == ("GET", DER_EVENTS)
     # DER messages never replace the Start/Stop/profile outcome.
     assert c.last_command == {"state": "not_sent"}
+
+
+@pytest.mark.asyncio
+async def test_der_message_waits_for_a_command_in_flight():
+    c = client(); await c.control_policy()
+    await c._command_lock.acquire()
+    pending = asyncio.create_task(c.set_der_control(set_body()))
+    await asyncio.sleep(0.01)
+    assert c.posts == [] and not pending.done()
+    c._command_lock.release()
+    assert await pending == {"status": "Accepted"}
+    assert c.posts == [(DER_ROUTES["set"], PARAMS, set_body())]
 
 
 @pytest.mark.parametrize("body", [
@@ -402,9 +415,11 @@ def test_service_names_are_the_ocpp_actions_without_a_lab_prefix():
     root = Path(__file__).resolve().parents[1] / "custom_components" / "citrine_ha"
     names = {lab_entities.SERVICE, lab_entities.SERVICE_RECONCILE, lab_entities.SERVICE_COST,
              lab_entities.SERVICE_TARIFF, lab_entities.SERVICE_DER_SET, lab_entities.SERVICE_DER_GET,
-             lab_entities.SERVICE_DER_CLEAR, lab_entities.SERVICE_DER_EVENTS}
+             lab_entities.SERVICE_DER_CLEAR, lab_entities.SERVICE_DER_EVENTS,
+             lab_entities.SERVICE_LOCAL_SET, lab_entities.SERVICE_LOCAL_CLEAR, lab_entities.SERVICE_LIMITS}
     assert names == {"set_tx_profile", "reconcile_command_state", "cost_updated", "set_default_tariff",
-                     "set_der_control", "get_der_control", "clear_der_control", "get_der_events"}
+                     "set_der_control", "get_der_control", "clear_der_control", "get_der_events",
+                     "set_local_generation_profile", "clear_local_generation_profile", "get_charging_limits"}
     documented = set(yaml.safe_load((root / "services.yaml").read_text()))
     assert names <= documented
     for strings in ("strings.json", "translations/en.json"):

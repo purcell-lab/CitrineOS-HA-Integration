@@ -140,6 +140,29 @@
             "name": "Transaction ID"
           }
         }
+      },
+      "ems_charging_limit": {
+        "name": "EMS charging limit",
+        "state_attributes": {
+          "source": {
+            "name": "Source"
+          },
+          "evse_id": {
+            "name": "EVSE ID"
+          },
+          "local_generation": {
+            "name": "Local generation"
+          },
+          "grid_critical": {
+            "name": "Grid critical"
+          },
+          "reported_at": {
+            "name": "Reported at"
+          },
+          "active_count": {
+            "name": "Active limits"
+          }
+        }
       }
     }
   },
@@ -154,7 +177,7 @@
         },
         "periods": {
           "name": "Periods",
-          "description": "CentralSetpoint or charging-only limit periods (W, at most 10)."
+          "description": "CentralSetpoint or charging-only limit periods (W, at most 10); ExternalLimits, ExternalSetpoint or LocalLoadBalancing (limit and dischargeLimit, no setpoint) when the server policy lists them."
         },
         "duration": {
           "name": "Duration",
@@ -333,6 +356,64 @@
     "reconcile_command_state": {
       "name": "Reconcile scoped lab command state",
       "description": "Re-read the CSMS (readiness, command policy and the command station's active transaction) and resolve an outcome_unknown, dispatch_not_confirmed or awaiting-evidence command without reloading the integration. A command sent less than 90 seconds ago may still land and is never cleared; the call fails with the remaining wait instead. Returns the resolved command state.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        }
+      }
+    },
+    "set_local_generation_profile": {
+      "name": "Set scoped lab local generation profile",
+      "description": "Send a LocalGeneration charging profile (OCPP 2.1) to the command station: Absolute from start_time, or Relative when it is empty.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "evse_id": {
+          "name": "EVSE ID",
+          "description": "0 for the whole station, or 1."
+        },
+        "profile_id": {
+          "name": "Profile ID",
+          "description": "Within the server policy's local_generation ids (9100 to 9199)."
+        },
+        "stack_level": {
+          "name": "Stack level",
+          "description": "0 to 10."
+        },
+        "start_time": {
+          "name": "Start time",
+          "description": "Absolute start (sent as UTC); empty for a Relative profile."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Schedule length in seconds, up to the policy maximum (86400)."
+        },
+        "periods": {
+          "name": "Periods",
+          "description": "List of start_period (s), limit (W, 0 to 25000) and optional number_phases (1 or 3); the first starts at 0, then strictly increasing."
+        }
+      }
+    },
+    "clear_local_generation_profile": {
+      "name": "Clear scoped lab local generation profile",
+      "description": "Send ClearChargingProfile (OCPP 2.1) for a LocalGeneration profile on the command station.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "The isolated CitrineOS config entry."
+        },
+        "profile_id": {
+          "name": "Profile ID",
+          "description": "The LocalGeneration profile to clear (9100 to 9199)."
+        }
+      }
+    },
+    "get_charging_limits": {
+      "name": "Read scoped lab charging limits",
+      "description": "Return the command station's active and recent charging limits from an EMS or other external actor, at most 20.",
       "fields": {
         "entry_id": {
           "name": "Entry ID",

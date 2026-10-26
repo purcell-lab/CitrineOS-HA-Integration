@@ -215,6 +215,92 @@ response_variable: der   # der.station_status, der.station_response.supersededId
 
 ---
 
+## Local energy (0.8.0, scoped lab profile)
+
+OCPP 2.1 local energy, through the CitrineOS Isolated Lab App 0.11.0
+`local_energy` policy key. When `/lab/control-policy` has no `local_energy`
+(an older App), only CentralSetpoint and charging-only periods are offered and
+the services below refuse; when the key is malformed, the same holds and one
+warning is logged. A part the key leaves out (`local_generation`,
+`operation_modes`, `charging_limits`) is not offered.
+
+**`set_tx_profile` operation modes.** A period may use `ExternalLimits`,
+`ExternalSetpoint` or `LocalLoadBalancing` only when `local_energy.operation_modes`
+lists it. Such a period carries `startPeriod`, `limit` (0 to 25000 W),
+`dischargeLimit` (-25000 to 0 W) and `operationMode`, and no `setpoint`: the
+station or a local EMS chooses the power within the bounds. A mode the policy
+does not list, a setpoint, a missing `limit` or `dischargeLimit`, or another
+key fails with a validation error before anything is sent. CentralSetpoint and
+charging-only periods are unchanged.
+
+```yaml
+action: citrine_ha.set_tx_profile
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+  periods:
+    - {startPeriod: 0, limit: 11000, dischargeLimit: -7000, operationMode: ExternalLimits}
+```
+
+| Service | Message | Fields |
+| --- | --- | --- |
+| `citrine_ha.set_local_generation_profile` | `SetChargingProfile` with a `LocalGeneration` profile for the command station, whatever its transactions | `evse_id` (0 or 1, default 0), `profile_id` (9100, within the policy's ids), `stack_level` (1), optional `start_time`, `duration` (86400 s, at most the policy maximum), `periods` (list of `start_period` s, `limit` W, optional `number_phases` 1 or 3) |
+| `citrine_ha.clear_local_generation_profile` | `ClearChargingProfile` for a `LocalGeneration` profile ID, allowed at any time | `profile_id` (9100) |
+| `citrine_ha.get_charging_limits` | `GET /lab/charging-limits`: the station's `NotifyChargingLimit` and `ClearedChargingLimit`, active and recent, newest first, at most 20 | none |
+
+`start_time` given makes the profile `Absolute` with `startSchedule` in UTC;
+left empty, it is `Relative`. Periods start at 0, then strictly increase, and
+stay below `duration`; at most `max_periods` (48). Values outside the policy's
+`local_generation` (EVSE IDs, profile IDs, maximum duration and periods), or a
+command station that is offline or not on OCPP 2.1, fail with a validation
+error before anything is sent. The station accepts the profile only if
+`SmartChargingCtrlr.SupportedAdditionalPurposes` lists `LocalGeneration`.
+
+The set and clear services return `sent`, `station_id`, `station_status`
+(`dispatched` for CitrineOS's send confirmation, which confirms the message
+was sent, not the station's reply) and the verbatim `station_response`.
+Gateway errors come back with the gateway's error text; a 502, 504 or no reply
+means the outcome may be unknown: do not retry automatically. These messages do
+not change the command state that Start, Stop and schedules use.
+
+```yaml
+action: citrine_ha.set_local_generation_profile
+data:
+  entry_id: "<the isolated CitrineOS entry ID>"
+  start_time: "2026-10-27T10:00:00+10:00"
+  duration: 18000
+  periods:
+    - {start_period: 0, limit: 3000}
+    - {start_period: 7200, limit: 6000, number_phases: 3}
+response_variable: lg   # lg.station_status, lg.sent.chargingProfile
+```
+
+**EMS charging limit sensor.** When the policy has
+`local_energy.charging_limits`, the command station gets a sensor
+**EMS charging limit** (W, for example
+`sensor.citrineos_everest_v2g_lab_sim_ev_everest_v2g_01_ems_charging_limit`).
+Its state is the limit in effect now from the newest active limit: its first
+schedule starts at `startSchedule`, or at `reported_at` when the schedule has
+none, and the period in effect is the last whose `startPeriod` has passed,
+until the schedule's `duration` ends. The state is unknown when there is no
+active limit, the limit has no schedule, the schedule has not started or has
+ended, or its rate unit is not W (the attribute `charging_rate_unit` then shows
+it). Attributes: `source`, `evse_id`, `local_generation`, `grid_critical`,
+`reported_at` and `active_count`. It is read on the discovery poll (the scan
+interval, at most every 25 s) and right after the services above; the sensor
+is unavailable while the read fails.
+
+**One command at a time.** The lab sends one command to the CSMS at a time:
+Start, Stop, `set_tx_profile`, the price messages, DER messages and the local
+energy services all share one slot. A command that finds another in flight
+waits up to 20 s for it to return, then runs its own checks against the state
+the first one left (an unresolved outcome still blocks it). Only after 20 s
+does it fail with "A lab command is still in progress after 20 s; nothing was
+sent". Nothing has been sent at that point, so the wait never resends a
+command. A transaction start that fires the schedule bridge, CostUpdated and
+SetDefaultTariff together therefore sends all three in turn.
+
+---
+
 ## Station power limits (0.6.2)
 
 Every discovered station gets two read-only sensors in W (device class power,
