@@ -70,6 +70,22 @@ DER_LIMITS = {"pct_max_discharge_power": [0, 100], "displacement": [0, 1],
               "var_setpoint_pct": [-100, 100], "max_duration_s": 86400}
 DER_CONTROL_ID = re.compile(r"[A-Za-z0-9._:-]{1,36}")
 DER_REQUEST_ID_MAX = 2147483647
+# OCPP 2.1 local energy (CitrineOS Isolated Lab App 0.11.0 local_energy).
+LOCAL_DISABLED = {"enabled": False}
+# Every operationMode the App may list; CentralSetpoint and ChargingOnly are always offered.
+OPERATION_MODES = ("ChargingOnly", "CentralSetpoint", "ExternalLimits", "ExternalSetpoint",
+                   "LocalLoadBalancing")
+BASE_MODES = ("ChargingOnly", "CentralSetpoint")
+# Bounded modes: limit and dischargeLimit required, no setpoint (the station or a local EMS
+# chooses the power within the bounds). Offered only when local_energy lists them.
+LOCAL_MODES = ("ExternalLimits", "ExternalSetpoint", "LocalLoadBalancing")
+LOCAL_PURPOSE = "LocalGeneration"
+CHARGING_LIMITS = "/lab/charging-limits"
+LOCAL_PROFILE_ID = 9100
+LOCAL_MAX_PERIODS = 48
+LOCAL_MAX_DURATION_S = 86400
+# The station's charging limits are read at most this often, on the discovery poll.
+CHARGING_LIMITS_MIN_INTERVAL_S = 25
 
 
 class CitrineUnavailableError(CitrineApiError):
@@ -219,8 +235,152 @@ def valid_der_clear(body, der):
             and isinstance(body.get("isDefault"), bool) and der_selector(body, der["control_types"]))
 
 
+def parse_local_energy(policy):
+    """Normalise the policy's optional local_energy key. Never raises.
+
+    Absent (an App before 0.11.0) means local energy off with only CentralSetpoint
+    and ChargingOnly periods. Malformed means the same, flagged invalid. A part
+    the key leaves out (local_generation, charging_limits) is simply not offered.
+    """
+    p = policy.get("local_energy") if isinstance(policy, dict) else None
+    if p is None:
+        return dict(LOCAL_DISABLED)
+    invalid = {**LOCAL_DISABLED, "invalid": True}
+    if not isinstance(p, dict):
+        return invalid
+    lg, modes, limits = p.get("local_generation"), p.get("operation_modes"), p.get("charging_limits")
+    if lg is not None:
+        ids, evse_ids = (lg.get("ids"), lg.get("evse_ids")) if isinstance(lg, dict) else (None, None)
+        if (not isinstance(lg, dict) or lg.get("purpose") != LOCAL_PURPOSE
+                or lg.get("protocol") != PROTOCOL
+                or not isinstance(ids, list) or len(ids) != 2
+                or not all(integer(x, 1, 2147483647) for x in ids) or ids[0] > ids[1]
+                or not isinstance(evse_ids, list) or not evse_ids
+                or not all(integer(x, 0, 2147483647) for x in evse_ids)
+                or len(set(evse_ids)) != len(evse_ids)
+                or not integer(lg.get("max_duration_s"), 1, LOCAL_MAX_DURATION_S)
+                or not integer(lg.get("max_periods"), 1, LOCAL_MAX_PERIODS)):
+            return invalid
+        lg = {"purpose": LOCAL_PURPOSE, "protocol": PROTOCOL, "ids": list(ids),
+              "evse_ids": list(evse_ids), "max_duration_s": lg["max_duration_s"],
+              "max_periods": lg["max_periods"]}
+    if modes is None:
+        modes = list(BASE_MODES)
+    if (not isinstance(modes, list) or not all(isinstance(m, str) for m in modes)
+            or len(set(modes)) != len(modes)):
+        return invalid
+    # Only the known route: a policy cannot point the limits read elsewhere.
+    if limits not in (None, CHARGING_LIMITS):
+        return invalid
+    return {"enabled": True, "local_generation": lg,
+            # A mode this integration does not know is not offered.
+            "operation_modes": [m for m in modes if m in OPERATION_MODES],
+            "charging_limits": limits}
+
+
+def local_modes(local):
+    """The bounded local modes (ExternalLimits ...) the parsed policy offers."""
+    return tuple(m for m in (local or {}).get("operation_modes", ()) if m in LOCAL_MODES)
+
+
+def valid_local_generation(body, lg):
+    """A LocalGeneration SetChargingProfile body inside the policy's local_generation."""
+    if not isinstance(body, dict) or set(body) != {"evseId", "chargingProfile"} or not lg:
+        return False
+    c = body["chargingProfile"]
+    if (body["evseId"] not in lg["evse_ids"] or type(body["evseId"]) is not int
+            or not isinstance(c, dict)
+            or set(c) != {"id", "stackLevel", "chargingProfilePurpose", "chargingProfileKind",
+                          "chargingSchedule"}
+            or not integer(c["id"], *lg["ids"]) or not integer(c["stackLevel"], 0, 10)
+            or c["chargingProfilePurpose"] != LOCAL_PURPOSE
+            or c["chargingProfileKind"] not in ("Absolute", "Relative")
+            or not isinstance(c["chargingSchedule"], list) or len(c["chargingSchedule"]) != 1):
+        return False
+    s = c["chargingSchedule"][0]
+    absolute = c["chargingProfileKind"] == "Absolute"
+    keys = {"id", "duration", "chargingRateUnit", "chargingSchedulePeriod"} | (
+        {"startSchedule"} if absolute else set())
+    if (not isinstance(s, dict) or set(s) != keys or not integer(s["id"], 0, 2147483647)
+            or (absolute and (not isinstance(s["startSchedule"], str)
+                              or _parse_time(s["startSchedule"]) is None))
+            or not integer(s["duration"], 1, lg["max_duration_s"]) or s["chargingRateUnit"] != "W"
+            or not isinstance(s["chargingSchedulePeriod"], list)
+            or not 1 <= len(s["chargingSchedulePeriod"]) <= lg["max_periods"]):
+        return False
+    last = -1
+    for index, p in enumerate(s["chargingSchedulePeriod"]):
+        if (not isinstance(p, dict) or set(p) - {"startPeriod", "limit", "numberPhases"}
+                or not integer(p.get("startPeriod"), 0, s["duration"] - 1)
+                or (index == 0 and p["startPeriod"] != 0) or p["startPeriod"] <= last
+                or not number(p.get("limit"), 0, MAX_IMPORT_W)
+                or ("numberPhases" in p and p["numberPhases"] not in (1, 3))
+                or isinstance(p.get("numberPhases"), bool)):
+            return False
+        last = p["startPeriod"]
+    return True
+
+
+def valid_local_clear(body, lg):
+    return (isinstance(body, dict) and set(body) == {"chargingProfileId"} and bool(lg)
+            and integer(body["chargingProfileId"], *lg["ids"]))
+
+
+def valid_charging_limits(reply):
+    return (isinstance(reply, dict) and isinstance(reply.get("active"), list)
+            and isinstance(reply.get("recent"), list))
+
+
+def charging_limit_now(reply, now=None):
+    """The station's charging limit in effect now, from /lab/charging-limits.
+
+    The newest active limit (the reply lists newest first) decides. Its first
+    schedule starts at startSchedule, or at reported_at when it has none; the
+    period in effect is the last whose startPeriod has passed, until the
+    schedule's duration ends. Returns (watts or None, attributes): None when
+    there is no active limit, it has no schedule, the schedule has not started
+    or has ended, or its rate unit is not W.
+    """
+    active = [x for x in (reply or {}).get("active") or [] if isinstance(x, dict)
+              and x.get("active") is not False]
+    newest = active[0] if active else {}
+    attrs = {"source": newest.get("source"), "evse_id": newest.get("evse_id"),
+             "local_generation": newest.get("local_generation"),
+             "grid_critical": newest.get("grid_critical"), "reported_at": newest.get("reported_at"),
+             "active_count": len(active)}
+    schedules = newest.get("schedule")
+    schedule = schedules[0] if isinstance(schedules, list) and schedules else None
+    if not isinstance(schedule, dict):
+        return None, attrs
+    attrs["charging_rate_unit"] = schedule.get("chargingRateUnit")
+    start = _parse_time(schedule.get("startSchedule") or newest.get("reported_at"))
+    if start is None:
+        return None, attrs
+    attrs["schedule_start"] = start.astimezone(UTC).isoformat()
+    elapsed = ((now or datetime.now(UTC)) - start).total_seconds()
+    duration = schedule.get("duration")
+    if elapsed < 0 or (number(duration, 0, math.inf) and elapsed >= duration):
+        return None, attrs
+    current = None
+    for p in schedule.get("chargingSchedulePeriod") or []:
+        if (isinstance(p, dict) and number(p.get("startPeriod"), 0, math.inf)
+                and p["startPeriod"] <= elapsed
+                and (current is None or p["startPeriod"] >= current["startPeriod"])):
+            current = p
+    if current is None or not number(current.get("limit"), -math.inf, math.inf):
+        return None, attrs
+    if schedule.get("chargingRateUnit") not in (None, "W"):
+        attrs["schedule_limit"] = current["limit"]
+        return None, attrs
+    return current["limit"], attrs
+
+
 class DerOutcomeUnknownError(CitrineApiError):
     """A DER message CitrineOS may not have sent, or the station did not answer in time."""
+
+
+class LocalOutcomeUnknownError(CitrineApiError):
+    """A local generation profile or clear whose dispatch CitrineOS may not have completed."""
 
 
 def paths_for(protocol):
@@ -244,14 +404,20 @@ def transaction(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9*_=:+|@.-]{1,64}", value) is not None
 
 
-def valid_period(p):
+def valid_period(p, modes=()):
     """A V2G CentralSetpoint period, or an AC charging-only limit period.
 
     Mirrors the lab server policy: charging-only periods carry a limit and
     optionally numberPhases 1 or 3, with phaseToUse (1-3) only for one phase.
+    modes are the bounded local modes (ExternalLimits, ExternalSetpoint,
+    LocalLoadBalancing) the policy offers: limit and dischargeLimit, no setpoint.
     """
     if not isinstance(p, dict) or not number(p.get("limit"), 0, MAX_IMPORT_W):
         return False
+    if p.get("operationMode") in LOCAL_MODES:
+        return (p["operationMode"] in modes
+                and set(p) == {"startPeriod", "limit", "dischargeLimit", "operationMode"}
+                and number(p.get("dischargeLimit"), -MAX_EXPORT_W, 0))
     if p.get("operationMode") == "CentralSetpoint":
         return (not set(p) - {"startPeriod", "limit", "dischargeLimit", "setpoint", "operationMode"}
                 and number(p.get("dischargeLimit"), -MAX_EXPORT_W, 0)
@@ -265,7 +431,7 @@ def valid_period(p):
 
 
 def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_ID,
-                  stack_level=1, start_at=None, immediate=False, price_schedule=None):
+                  stack_level=1, start_at=None, immediate=False, price_schedule=None, modes=()):
     """Produce one bounded absolute TxProfile, never a default/station profile.
 
     immediate starts the schedule one second ago, so a replacement profile
@@ -289,7 +455,7 @@ def build_profile(transaction_id, periods, *, duration=240, profile_id=PROFILE_I
     last = -1
     normalized = []
     for index, p in enumerate(periods):
-        if (not valid_period(p)
+        if (not valid_period(p, modes)
                 or not integer(p.get("startPeriod"), 0, duration - 1)
                 or (index == 0 and p["startPeriod"] != 0) or p["startPeriod"] <= last):
             raise CitrineCompatibilityError(
@@ -386,6 +552,12 @@ class ScopedLabClient(CitrineClient):
         self.price_commands: dict[str, Any] = dict(PRICES_DISABLED)
         # Off until a policy reports der_commands enabled.
         self.der_commands: dict[str, Any] = dict(DER_DISABLED)
+        # Off until a policy carries local_energy (CitrineOS Isolated Lab App 0.11.0).
+        self.local_energy: dict[str, Any] = dict(LOCAL_DISABLED)
+        # The newest /lab/charging-limits reply, when it was read, and the last read error.
+        self.charging_limits: dict[str, Any] | None = None
+        self.charging_limits_at: datetime | None = None
+        self.charging_limits_error: str | None = None
         self.last_command: dict[str, Any] = {"state": "not_sent"}
         self.evidence_timeout = EVIDENCE_TIMEOUT_S
         # Unknown until the first readiness check; only a failed check blocks commands.
@@ -575,6 +747,10 @@ class ScopedLabClient(CitrineClient):
         if der.get("invalid") and not self.der_commands.get("invalid"):
             _LOGGER.warning("Server der_commands policy is malformed; DER controls stay disabled")
         self.der_commands = der
+        local = parse_local_energy(p)
+        if local.get("invalid") and not self.local_energy.get("invalid"):
+            _LOGGER.warning("Server local_energy policy is malformed; local energy features stay disabled")
+        self.local_energy = local
         return p
 
     async def _ping(self):
@@ -639,6 +815,15 @@ class ScopedLabClient(CitrineClient):
             await self._csms_call(self.ready())
             policy = await self._csms_call(self.control_policy())
             self._csms_recovered()
+            if action == "profile":
+                # A local mode withdrawn by the fresh policy is honoured.
+                offered = local_modes(self.local_energy)
+                used = {p.get("operationMode") for p in
+                        payload["chargingProfile"]["chargingSchedule"][0]["chargingSchedulePeriod"]}
+                if used & set(LOCAL_MODES) - set(offered):
+                    raise CitrineCompatibilityError(
+                        "operationMode not offered by the server local_energy policy: "
+                        + ", ".join(sorted(used & set(LOCAL_MODES) - set(offered))))
             # The fresh policy decides the route; a price switch turned off since is honoured.
             path = (self.price_path(action, protocol, station_id, parse_price_commands(policy))
                     if price else paths_for(protocol)[action])
@@ -722,7 +907,7 @@ class ScopedLabClient(CitrineClient):
                 raise CitrineCompatibilityError("Price schedule outside the server's price policy")
         payload = build_profile(transaction_id, periods, duration=duration, profile_id=profile_id,
                                 stack_level=stack_level, start_at=start_at, immediate=immediate,
-                                price_schedule=price_schedule)
+                                price_schedule=price_schedule, modes=local_modes(self.local_energy))
         return await self._dispatch("profile", payload, protocol=protocol, station_id=station_id)
 
     async def cost_updated(self, *, protocol, station_id, body):
@@ -831,6 +1016,118 @@ class ScopedLabClient(CitrineClient):
     async def der_events(self):
         """The newest DER reports and notifications from the command station (at most 20)."""
         return await self._der("events")
+
+    def require_local(self, part, local=None):
+        """The parsed local_energy policy when it offers part, else CitrineCompatibilityError."""
+        local = local or self.local_energy
+        if not local.get("enabled") or not local.get(part):
+            raise CitrineCompatibilityError(
+                f"Local energy {part} is not offered by the server policy (CitrineOS Isolated Lab "
+                "App 0.11.0 local_energy)"
+                + ("; its local_energy policy is malformed" if local.get("invalid") else ""))
+        return local
+
+    async def _local(self, action, body=None):
+        """One LocalGeneration profile, clear or charging-limits read. Never retried.
+
+        The profile is the station's, not the session's: it is allowed whatever
+        the transactions and never replaces the Start, Stop or schedule outcome.
+        """
+        if self.read_only:
+            raise CitrineReadOnlyError("Lab controls are disabled")
+        part = "charging_limits" if action == "limits" else "local_generation"
+        self.require_local(part)
+        if self._command_lock.locked():
+            raise CitrineApiError("A lab command is already in progress")
+        self.require_csms()
+        async with self._command_lock:
+            await self._csms_call(self.ready())
+            await self._csms_call(self.control_policy())
+            self._csms_recovered()
+            # Withdrawn or narrowed since the last poll: checked against the fresh policy.
+            local = self.require_local(part)
+            if action == "limits":
+                reply = await self._command_client._request("GET", local["charging_limits"])
+                if not valid_charging_limits(reply):
+                    raise CitrineApiError("Unexpected /lab/charging-limits reply")
+                self._limits_read(reply)
+                return reply
+            lg = local["local_generation"]
+            valid = valid_local_generation if action == "profile" else valid_local_clear
+            if not valid(body, lg):
+                raise CitrineCompatibilityError(
+                    "Local generation request outside the server's local_energy policy")
+            try:
+                response = await self._command_client._request(
+                    "POST", PATHS[action], params={"identifier": self.station, "tenantId": 1}, json=body)
+            except (CitrineHttpError, CitrineTransportError) as err:
+                status = getattr(err, "status", None)
+                if status in (502, 504) or isinstance(err, CitrineTransportError):
+                    what = {502: "bad gateway (502)", 504: "gateway timeout (504)"}.get(
+                        status, "no gateway reply")
+                    detail = getattr(err, "detail", None)
+                    name = "setChargingProfile" if action == "profile" else "clearChargingProfile"
+                    raise LocalOutcomeUnknownError(
+                        f"{name} ({LOCAL_PURPOSE}): {what}" + (f" ({detail})" if detail else "")
+                        + "; the outcome may be unknown, do not retry automatically") from err
+                raise
+            # A send confirmation, or a station reply or CALLERROR passed through.
+            if isinstance(response, list) and not (
+                    len(response) == 1 and isinstance(response[0], dict)
+                    and response[0].get("success") is True):
+                raise LocalOutcomeUnknownError(
+                    "Dispatch not confirmed; the outcome may be unknown, do not retry automatically")
+            return response
+
+    async def set_local_generation_profile(self, body):
+        """SetChargingProfile with a LocalGeneration profile for the command station."""
+        if not valid_local_generation(body, self.require_local("local_generation")["local_generation"]):
+            raise CitrineCompatibilityError("Local generation profile outside the server's local_energy policy")
+        return await self._local("profile", body)
+
+    async def clear_local_generation_profile(self, profile_id):
+        body = {"chargingProfileId": profile_id}
+        if not valid_local_clear(body, self.require_local("local_generation")["local_generation"]):
+            raise CitrineCompatibilityError("Profile ID outside the server's local_generation ids")
+        return await self._local("clear", body)
+
+    async def get_charging_limits(self):
+        """GET /lab/charging-limits: the station's NotifyChargingLimit and ClearedChargingLimit."""
+        return await self._local("limits")
+
+    def _limits_read(self, reply, now=None):
+        if self.charging_limits_error is not None:
+            _LOGGER.info("Charging limits read again after: %s", self.charging_limits_error)
+        self.charging_limits = deepcopy(reply)
+        self.charging_limits_at = now or datetime.now(UTC)
+        self.charging_limits_error = None
+
+    async def poll_charging_limits(self, *, force=False, now=None):
+        """Read /lab/charging-limits on the discovery poll, at most every 25 s. Never raises.
+
+        A failed read keeps nothing stale: the reply is dropped and the error kept,
+        with one warning per failure streak.
+        """
+        local = self.local_energy
+        if self.read_only or not local.get("enabled") or not local.get("charging_limits"):
+            self.charging_limits = None
+            return
+        now = now or datetime.now(UTC)
+        if (not force and self.charging_limits_at is not None and self.charging_limits_error is None
+                and (now - self.charging_limits_at).total_seconds() < CHARGING_LIMITS_MIN_INTERVAL_S):
+            return
+        try:
+            reply = await self._command_client._request("GET", local["charging_limits"])
+            if not valid_charging_limits(reply):
+                raise CitrineApiError("Unexpected /lab/charging-limits reply")
+        except CitrineApiError as err:
+            if self.charging_limits_error is None:
+                _LOGGER.warning("Charging limits read failed: %s", err)
+            self.charging_limits = None
+            self.charging_limits_at = now
+            self.charging_limits_error = str(err)
+            return
+        self._limits_read(reply, now)
 
     async def set_station_limit(self, **kwargs):
         raise CitrineCompatibilityError("Station-wide limits are not enabled in the lab profile")

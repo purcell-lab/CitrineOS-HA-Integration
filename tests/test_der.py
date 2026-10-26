@@ -402,9 +402,11 @@ def test_service_names_are_the_ocpp_actions_without_a_lab_prefix():
     root = Path(__file__).resolve().parents[1] / "custom_components" / "citrine_ha"
     names = {lab_entities.SERVICE, lab_entities.SERVICE_RECONCILE, lab_entities.SERVICE_COST,
              lab_entities.SERVICE_TARIFF, lab_entities.SERVICE_DER_SET, lab_entities.SERVICE_DER_GET,
-             lab_entities.SERVICE_DER_CLEAR, lab_entities.SERVICE_DER_EVENTS}
+             lab_entities.SERVICE_DER_CLEAR, lab_entities.SERVICE_DER_EVENTS,
+             lab_entities.SERVICE_LOCAL_SET, lab_entities.SERVICE_LOCAL_CLEAR, lab_entities.SERVICE_LIMITS}
     assert names == {"set_tx_profile", "reconcile_command_state", "cost_updated", "set_default_tariff",
-                     "set_der_control", "get_der_control", "clear_der_control", "get_der_events"}
+                     "set_der_control", "get_der_control", "clear_der_control", "get_der_events",
+                     "set_local_generation_profile", "clear_local_generation_profile", "get_charging_limits"}
     documented = set(yaml.safe_load((root / "services.yaml").read_text()))
     assert names <= documented
     for strings in ("strings.json", "translations/en.json"):

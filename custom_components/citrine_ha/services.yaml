@@ -351,7 +351,7 @@ emergency_safe_mode:
         text:
 set_tx_profile:
   name: Submit scoped lab schedule
-  description: Send one bounded OCPP 2.1 schedule to the currently active EVerest lab transaction. W only, 600 seconds maximum, no fallback or retry. Periods are V2G CentralSetpoint periods or AC charging-only limits (optional numberPhases 1 or 3). immediate starts the schedule now, so a replacement leaves no unlimited gap.
+  description: Send one bounded OCPP 2.1 schedule to the currently active EVerest lab transaction. W only, 600 seconds maximum, no fallback or retry. Periods are V2G CentralSetpoint periods or AC charging-only limits (optional numberPhases 1 or 3); with CitrineOS Isolated Lab App 0.11.0, also ExternalLimits, ExternalSetpoint or LocalLoadBalancing periods when its local_energy policy lists the mode (limit and dischargeLimit required, no setpoint). immediate starts the schedule now, so a replacement leaves no unlimited gap.
   fields:
     entry_id:
       required: true
@@ -592,6 +592,78 @@ clear_der_control:
 get_der_events:
   name: Read scoped lab DER events
   description: Return the command station's newest DER messages (ReportDERControl, NotifyDERStartStop, NotifyDERAlarm), newest first, at most 20.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+
+set_local_generation_profile:
+  name: Set scoped lab local generation profile
+  description: Send SetChargingProfile (OCPP 2.1) with a LocalGeneration profile to the command station, whatever its transactions. W limits per period (0 to 25000 W, optional numberPhases 1 or 3). start_time given makes it Absolute from that time (sent as UTC); left empty, Relative. Needs the App's local_energy.local_generation (CitrineOS Isolated Lab App 0.11.0); the station accepts it only if SmartChargingCtrlr.SupportedAdditionalPurposes lists LocalGeneration. Returns what was sent and the gateway reply. A 502 or 504 means the outcome may be unknown; do not retry automatically.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    evse_id:
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 1
+          mode: box
+    profile_id:
+      default: 9100
+      selector:
+        number:
+          min: 9100
+          max: 9199
+          mode: box
+    stack_level:
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 10
+          mode: box
+    start_time:
+      required: false
+      selector:
+        datetime:
+    duration:
+      default: 86400
+      selector:
+        number:
+          min: 1
+          max: 86400
+          unit_of_measurement: s
+          mode: box
+    periods:
+      required: true
+      example: "[{start_period: 0, limit: 5000}, {start_period: 3600, limit: 0, number_phases: 3}]"
+      selector:
+        object:
+
+clear_local_generation_profile:
+  name: Clear scoped lab local generation profile
+  description: Send ClearChargingProfile (OCPP 2.1) for a LocalGeneration profile ID on the command station, allowed at any time. Needs the App's local_energy.local_generation. A 502 or 504 means the outcome may be unknown; do not retry automatically.
+  fields:
+    entry_id:
+      required: true
+      selector:
+        text:
+    profile_id:
+      default: 9100
+      selector:
+        number:
+          min: 9100
+          max: 9199
+          mode: box
+
+get_charging_limits:
+  name: Read scoped lab charging limits
+  description: Return the command station's charging limits from an EMS or other external actor (NotifyChargingLimit and ClearedChargingLimit), active and recent, newest first, at most 20. Needs the App's local_energy.charging_limits.
   fields:
     entry_id:
       required: true

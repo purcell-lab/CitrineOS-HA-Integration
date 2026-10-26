@@ -135,6 +135,10 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if station["id"] == lab_station:
                         station["lab_meter"] = await fetch_meter(self._hasura_client, station, tenant_id)
                         self._citrine_client.observe_transaction(station)
+                # The station's EMS charging limits, on this poll (at most every 25 s); never fails discovery.
+                from .lab_control import ScopedLabClient
+                if isinstance(self._citrine_client, ScopedLabClient):
+                    await self._citrine_client.poll_charging_limits()
             self._refresh_station_caches(merged)
             # Protocol is not a capability declaration. Keep all unverified
             # stations read-only, even in an entry with scoped lab controls.
