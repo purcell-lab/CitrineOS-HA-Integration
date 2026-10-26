@@ -296,7 +296,7 @@ waits up to 20 s for it to return, then runs its own checks against the state
 the first one left (an unresolved outcome still blocks it). Only after 20 s
 does it fail with "A lab command is still in progress after 20 s; nothing was
 sent". Nothing has been sent at that point, so the wait never resends a
-command. A transaction start that fires the schedule bridge, CostUpdated and
+command. A transaction start that fires the bridge's TxProfile, CostUpdated and
 SetDefaultTariff together therefore sends all three in turn.
 
 ---
