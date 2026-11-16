@@ -102,13 +102,16 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._capability_cache: dict[str, dict[str, Any]] = {}
         self._profile_prefs: dict[str, dict[str, Any]] = {}
         self._power_limits = PowerLimitReader(hasura_client)
+        # Chargetronic sessions, set by the integration when its webhook is configured.
+        self.chargetronic: Any | None = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         tenant_id = int(self._entry_data[CONF_TENANT_ID])
         try:
             data = await self._fetch_discovery(tenant_id)
             # Never fails discovery: a refused or missing table only drops a source.
-            await self._power_limits.async_attach(data, self.default_max_power_w)
+            overrides = self.chargetronic.charge_limits() if self.chargetronic is not None else None
+            await self._power_limits.async_attach(data, self.default_max_power_w, overrides)
             return data
         except (CitrineApiError, HasuraError, ValueError) as err:
             # A lab dispatch still ends after its evidence window while polls fail.

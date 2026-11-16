@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from . import chargetronic
 from .citrine_api import CitrineApiError, CitrineClient
 from .const import (
     ATTR_DURATION,
@@ -36,6 +37,9 @@ from .const import (
     ATTR_SITE_ID,
     ATTR_TELEMETRY_LIMIT,
     CONF_AUTH_TOKEN,
+    CONF_CHARGETRONIC_DEVICES,
+    CONF_CHARGETRONIC_SECRET,
+    CONF_CHARGETRONIC_WEBHOOK_ID,
     CONF_BASE_URL,
     CONF_CONTROLLER_MODE,
     CONF_DEFAULT_EVSE_ID,
@@ -137,6 +141,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "controller": controller,
     }
 
+    secret, webhook_id = values.get(CONF_CHARGETRONIC_SECRET), values.get(CONF_CHARGETRONIC_WEBHOOK_ID)
+    if secret and webhook_id:
+        coordinator.chargetronic = await chargetronic.async_setup(
+            hass, entry, secret=secret, webhook_id=webhook_id,
+            devices=chargetronic.parse_devices(values.get(CONF_CHARGETRONIC_DEVICES)),
+            on_update=lambda: hass.async_create_task(coordinator.async_request_refresh()))
+        hass.data[DOMAIN][entry.entry_id]["chargetronic"] = coordinator.chargetronic
+        hass.data[DOMAIN][entry.entry_id]["chargetronic_webhook_id"] = webhook_id
+
     platforms = ["sensor"] if client.read_only else PLATFORMS
     if client.api_profile == PROFILE_LAB and not client.read_only:
         platforms = ["sensor", "button", "number"]
@@ -154,6 +167,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_data = hass.data[DOMAIN].get(entry.entry_id)
     if entry_data and "controller" in entry_data:
         await entry_data["controller"].async_stop()
+    if entry_data and entry_data.get("chargetronic_webhook_id"):
+        chargetronic.async_unload(hass, entry_data["chargetronic_webhook_id"])
 
     platforms = entry_data.get("platforms", PLATFORMS) if entry_data else PLATFORMS
     unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
