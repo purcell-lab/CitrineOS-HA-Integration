@@ -483,6 +483,6 @@ def test_service_names_pinned():
         data = json.loads((root / strings).read_text())
         assert names <= set(data["services"]), strings
         assert data["entity"]["sensor"]["ems_charging_limit"]["name"] == "EMS charging limit"
-    assert json.loads((root / "manifest.json").read_text())["version"] == "0.8.0"
+    assert json.loads((root / "manifest.json").read_text())["version"] == "0.9.0"
     assert (root / "translations/en.json").read_bytes().count(b"\r\n") == \
         (root / "translations/en.json").read_bytes().count(b"\n")

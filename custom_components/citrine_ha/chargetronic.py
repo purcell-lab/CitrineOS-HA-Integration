@@ -262,6 +262,9 @@ async def async_setup(hass: Any, entry: Any, *, secret: str, webhook_id: str,
             async_dispatcher_send(hass, signal(entry.entry_id), device)
             if on_update is not None and device in sessions.devices:
                 on_update()
+        elif result == STALE:
+            # Counted but no session change: refresh the connector sensor only.
+            async_dispatcher_send(hass, signal(entry.entry_id), None)
         return web.Response(status=200)
 
     webhook.async_register(hass, "citrine_ha", "Chargetronic", webhook_id, handle,

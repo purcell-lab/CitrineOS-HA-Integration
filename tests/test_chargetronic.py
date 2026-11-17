@@ -196,12 +196,13 @@ def test_webhook_handler(monkeypatch):
         bad = FakeRequest(b"not json", {"webhook-id": "evt_3", "webhook-timestamp": str(NOW),
                                         "webhook-signature": f"v1,{sign(SECRET, 'evt_3', NOW, b'not json')}"})
         assert (await handler(hass, "hook1", bad)).status == 400
+        assert await post(event(4, "test.ping")) == 200  # unknown type: counted, connector refreshed
         return sessions
 
     sessions = asyncio.run(run())
     assert registered["hook_id"] == "hook1" and registered["local_only"] is False
     assert registered["allowed_methods"] == ["POST"]
-    assert sessions.received == 1 and refreshes == [1]
-    assert sent == [("citrine_ha_chargetronic_entry1", "sp-dev-01")]
+    assert sessions.received == 2 and refreshes == [1]
+    assert sent == [("citrine_ha_chargetronic_entry1", "sp-dev-01"), ("citrine_ha_chargetronic_entry1", None)]
     fired = hass.bus.async_fire.call_args.args
     assert fired[0] == "citrine_ha_chargetronic" and fired[1]["station_id"] == STATION

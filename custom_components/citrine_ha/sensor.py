@@ -1046,8 +1046,9 @@ def _setup_chargetronic(hass: HomeAssistant, entry: ConfigEntry, async_add_entit
         _add(device)
 
     @callback
-    def _updated(device: str) -> None:
-        _add(device)
+    def _updated(device: str | None) -> None:
+        if device is not None:
+            _add(device)
         connector.async_write_ha_state()
 
     entry.async_on_unload(async_dispatcher_connect(hass, chargetronic_signal(entry.entry_id), _updated))
@@ -1102,7 +1103,7 @@ class ChargetronicEnergyNeedSensor(SensorEntity):
             self.hass, chargetronic_signal(self._entry.entry_id), self._updated))
 
     @callback
-    def _updated(self, device: str) -> None:
+    def _updated(self, device: str | None) -> None:
         if device == self._device:
             self.async_write_ha_state()
 
