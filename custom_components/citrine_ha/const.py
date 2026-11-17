@@ -22,6 +22,9 @@ CONF_EMS_TELEMETRY_SITE_ID = "ems_telemetry_site_id"
 CONF_EMS_TELEMETRY_LIMIT = "ems_telemetry_limit"
 CONF_EMS_TELEMETRY_STALE_SECS = "ems_telemetry_stale_secs"
 CONF_DEFAULT_MAX_POWER_W = "default_max_power_w"
+CONF_CHARGETRONIC_SECRET = "chargetronic_secret"
+CONF_CHARGETRONIC_WEBHOOK_ID = "chargetronic_webhook_id"
+CONF_CHARGETRONIC_DEVICES = "chargetronic_devices"
 
 DEFAULT_NAME = "CitrineOS"
 DEFAULT_TENANT_ID = 1

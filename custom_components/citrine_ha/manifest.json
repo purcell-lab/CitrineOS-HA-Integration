@@ -5,7 +5,9 @@
     "@ssimpson"
   ],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": [
+    "webhook"
+  ],
   "documentation": "https://github.com/Stuart0411/CitrineOS-HA-Integration",
   "integration_type": "hub",
   "iot_class": "local_polling",
@@ -14,5 +16,5 @@
     "custom_components.citrine_ha"
   ],
   "requirements": [],
-  "version": "0.8.0"
+  "version": "0.9.0"
 }

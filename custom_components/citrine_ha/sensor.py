@@ -11,12 +11,14 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfElectricCurrent, UnitOfPower
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from .chargetronic import ChargetronicSessions, signal as chargetronic_signal
 from .const import CONF_TENANT_ID, DOMAIN
 from .coordinator import CitrineCoordinator
 from .load_controller import CitrineLoadController
@@ -30,6 +32,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensor entities from coordinator data."""
     from .compatibility import PROFILE_LAB
+    _setup_chargetronic(hass, entry, async_add_entities)
     if hass.data[DOMAIN][entry.entry_id]["client"].api_profile == PROFILE_LAB:
         from .lab_entities import setup_lab
         await setup_lab(hass, entry, async_add_entities, "sensor")
@@ -1022,3 +1025,101 @@ class CitrinePhaseCurrentSensor(SensorEntity):
         return _site_device_info(self._entry)
 
 
+
+
+def _setup_chargetronic(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    """A connector sensor, then one energy need sensor per Chargetronic device as it first reports."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    sessions: ChargetronicSessions | None = data.get("chargetronic")
+    if sessions is None:
+        return
+    connector = ChargetronicConnectorSensor(entry, sessions, data["chargetronic_webhook_id"])
+    known: set[str] = set()
+
+    def _add(device: str) -> None:
+        if device not in known:
+            known.add(device)
+            async_add_entities([ChargetronicEnergyNeedSensor(entry, sessions, device)])
+
+    async_add_entities([connector])
+    for device in sessions.devices:
+        _add(device)
+
+    @callback
+    def _updated(device: str | None) -> None:
+        if device is not None:
+            _add(device)
+        connector.async_write_ha_state()
+
+    entry.async_on_unload(async_dispatcher_connect(hass, chargetronic_signal(entry.entry_id), _updated))
+
+
+class ChargetronicConnectorSensor(SensorEntity):
+    """Webhook health: events received and the last one."""
+
+    _attr_icon = "mdi:webhook"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_should_poll = False
+
+    def __init__(self, entry: ConfigEntry, sessions: ChargetronicSessions, webhook_id: str) -> None:
+        self._entry = entry
+        self._sessions = sessions
+        self._webhook_id = webhook_id
+        self._attr_unique_id = f"{entry.entry_id}_chargetronic_connector"
+        self._attr_name = "Chargetronic events received"
+
+    @property
+    def native_value(self) -> int:
+        return self._sessions.received
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"webhook_path": f"/api/webhook/{self._webhook_id}",
+                "devices": dict(self._sessions.devices),
+                "last_event": self._sessions.last_event}
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return _site_device_info(self._entry)
+
+
+class ChargetronicEnergyNeedSensor(SensorEntity):
+    """The energy the plugged-in car still needs (Wh), as Chargetronic last reported it."""
+
+    _attr_icon = "mdi:car-electric"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_native_unit_of_measurement = "Wh"
+    _attr_should_poll = False
+
+    def __init__(self, entry: ConfigEntry, sessions: ChargetronicSessions, device: str) -> None:
+        self._entry = entry
+        self._sessions = sessions
+        self._device = device
+        self._attr_unique_id = f"{entry.entry_id}_chargetronic_{device}_energy_need"
+        self._attr_name = f"Chargetronic {device} energy need"
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, chargetronic_signal(self._entry.entry_id), self._updated))
+
+    @callback
+    def _updated(self, device: str | None) -> None:
+        if device == self._device:
+            self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        """None (unknown) when unplugged or not reported; never 0 for missing data."""
+        session = self._sessions.active(self._device)
+        return None if session is None else session["energy_need_wh"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        session = self._sessions.sessions.get(self._device) or {}
+        return {"plugged_in": self._sessions.active(self._device) is not None,
+                "station_id": self._sessions.devices.get(self._device),
+                **{k: v for k, v in session.items() if k not in ("device_id", "station_id")}}
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return _site_device_info(self._entry)

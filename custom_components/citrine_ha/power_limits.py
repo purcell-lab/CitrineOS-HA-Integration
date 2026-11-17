@@ -33,6 +33,7 @@ SOURCE_EV = "ev_charging_needs"
 SOURCE_EVSE = "evse_rating"
 SOURCE_EVSE_SHARED = "evse_max_limit_shared"
 SOURCE_FALLBACK = "fallback"
+SOURCE_CHARGETRONIC = "chargetronic"
 
 CHARGE = "charge"
 DISCHARGE = "discharge"
@@ -270,10 +271,10 @@ def device_model_ratings(
 
 
 def select_limit(ev_w: float | None, rating: tuple[float, str] | None, fallback_w: float,
-                 transaction_id: Any = None) -> dict[str, Any]:
+                 transaction_id: Any = None, ev_source: str = SOURCE_EV) -> dict[str, Any]:
     """The smallest available source, else the fallback, with its attributes."""
     rating_w, rating_source = rating if rating else (None, SOURCE_EVSE)
-    candidates = [(v, s) for v, s in ((ev_w, SOURCE_EV), (rating_w, rating_source)) if v is not None]
+    candidates = [(v, s) for v, s in ((ev_w, ev_source), (rating_w, rating_source)) if v is not None]
     value, source = min(candidates, key=lambda c: c[0]) if candidates else (fallback_w, SOURCE_FALLBACK)
     return {"value": round(value), "source": source,
             "ev_limit_w": None if ev_w is None else round(ev_w),
@@ -324,8 +325,15 @@ class PowerLimitReader:
         self._warned: set[str] = set()
         self._transient = False
 
-    async def async_attach(self, data: dict[str, Any], fallback_w: float) -> None:
-        """Add "power_limits" to every station in a discovery payload."""
+    async def async_attach(self, data: dict[str, Any], fallback_w: float,
+                           ev_charge_overrides: dict[str, float] | None = None) -> None:
+        """Add "power_limits" to every station in a discovery payload.
+
+        ev_charge_overrides (station id -> W) is the plugged-in car's charge limit
+        from another source, such as Chargetronic. It is used only when CitrineOS
+        has no ChargingNeeds charge limit for the station, on any OCPP version.
+        """
+        overrides = ev_charge_overrides or {}
         stations = [s for s in data.get("stations", []) if isinstance(s, dict) and s.get("id")]
         eligible = [s for s in stations if not is_ocpp16(s.get("protocol"))]
         active = self._active_transactions(eligible, data.get("transactions") or [])
@@ -342,9 +350,13 @@ class PowerLimitReader:
             needs = self._needs.get(tx["db"], {}) if tx and not is_ocpp16(station.get("protocol")) else {}
             rating = {} if is_ocpp16(station.get("protocol")) else self._ratings.get(self._key(station), {})
             tx_id = station.get("activeTransactionId")
-            station["power_limits"] = {
-                direction: select_limit(needs.get(direction), rating.get(direction), fallback_w, tx_id)
-                for direction in (CHARGE, DISCHARGE)}
+            limits = {}
+            for direction in (CHARGE, DISCHARGE):
+                ev_w, ev_source = needs.get(direction), SOURCE_EV
+                if ev_w is None and direction == CHARGE and overrides.get(sid) is not None:
+                    ev_w, ev_source = overrides[sid], SOURCE_CHARGETRONIC
+                limits[direction] = select_limit(ev_w, rating.get(direction), fallback_w, tx_id, ev_source)
+            station["power_limits"] = limits
 
     @staticmethod
     def _key(station: dict[str, Any]) -> str:

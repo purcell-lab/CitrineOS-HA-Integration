@@ -82,7 +82,10 @@
           "scan_interval": "Discovery Scan Interval (seconds)",
           "default_id_tag": "Default ID Tag",
           "default_evse_id": "Default EVSE ID",
-          "default_max_power_w": "Fallback max charge/discharge power (W) when CitrineOS reports no EV limit or EVSE rating"
+          "default_max_power_w": "Fallback max charge/discharge power (W) when CitrineOS reports no EV limit or EVSE rating",
+          "chargetronic_secret": "Chargetronic webhook signing secret (leave blank to keep the saved one)",
+          "chargetronic_webhook_id": "Chargetronic webhook ID (the URL is /api/webhook/<ID>)",
+          "chargetronic_devices": "Chargetronic devices to stations, e.g. sp-dev-01=STATION-ID, one pair per comma"
         }
       }
     }
@@ -96,6 +99,7 @@
             "name": "Source",
             "state": {
               "ev_charging_needs": "EV charging needs",
+              "chargetronic": "Chargetronic EV energy request",
               "evse_rating": "EVSE rating",
               "evse_max_limit_shared": "EVSE maxLimit (shared by all stations)",
               "fallback": "Fallback option"
@@ -122,6 +126,7 @@
             "name": "Source",
             "state": {
               "ev_charging_needs": "EV charging needs",
+              "chargetronic": "Chargetronic EV energy request",
               "evse_rating": "EVSE rating",
               "evse_max_limit_shared": "EVSE maxLimit (shared by all stations)",
               "fallback": "Fallback option"

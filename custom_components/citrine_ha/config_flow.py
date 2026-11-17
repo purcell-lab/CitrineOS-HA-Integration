@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
 import voluptuous as vol
@@ -28,6 +29,9 @@ from .const import (
     CONF_DEADBAND_W,
     CONF_DEFAULT_EVSE_ID,
     CONF_DEFAULT_ID_TAG,
+    CONF_CHARGETRONIC_DEVICES,
+    CONF_CHARGETRONIC_SECRET,
+    CONF_CHARGETRONIC_WEBHOOK_ID,
     CONF_DEFAULT_MAX_POWER_W,
     CONF_DOE_EXPORT_LIMIT_SENSOR,
     CONF_DOE_IMPORT_LIMIT_SENSOR,
@@ -400,6 +404,34 @@ def _max_power_field(values: dict[str, Any]) -> dict[Any, Any]:
                                       unit_of_measurement="W", mode=selector.NumberSelectorMode.BOX))}
 
 
+def _chargetronic_fields(values: dict[str, Any]) -> dict[Any, Any]:
+    """Chargetronic webhook: on when both a secret and a webhook ID are saved.
+
+    The secret is never shown back; a blank secret keeps the saved one. A blank
+    webhook ID switches the webhook off.
+    """
+    webhook_id = values.get(CONF_CHARGETRONIC_WEBHOOK_ID)
+    return {
+        vol.Optional(CONF_CHARGETRONIC_SECRET): selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
+        vol.Optional(CONF_CHARGETRONIC_WEBHOOK_ID,
+                     default=webhook_id if webhook_id is not None else secrets.token_hex(16)):
+            selector.TextSelector(),
+        vol.Optional(CONF_CHARGETRONIC_DEVICES, default=str(values.get(CONF_CHARGETRONIC_DEVICES) or "")):
+            selector.TextSelector(),
+    }
+
+
+def _keep_chargetronic_secret(user_input: dict[str, Any], saved: dict[str, Any]) -> dict[str, Any]:
+    """A blank secret field keeps the saved secret."""
+    if user_input.get(CONF_CHARGETRONIC_SECRET):
+        return user_input
+    kept = {k: v for k, v in user_input.items() if k != CONF_CHARGETRONIC_SECRET}
+    if saved.get(CONF_CHARGETRONIC_SECRET):
+        kept[CONF_CHARGETRONIC_SECRET] = saved[CONF_CHARGETRONIC_SECRET]
+    return kept
+
+
 class CitrineOptionsFlow(config_entries.OptionsFlow):
     """Handle Citrine options flow."""
 
@@ -417,6 +449,7 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(CONF_SCAN_INTERVAL, default=values.get(CONF_SCAN_INTERVAL, 10)):
                     selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=60, step=1)),
                 **_max_power_field(values),
+                **_chargetronic_fields(values),
             })
         schema: dict[Any, Any] = {}
         schema[vol.Required(CONF_READ_ONLY, default=is_read_only(values))] = selector.BooleanSelector()
@@ -575,11 +608,13 @@ class CitrineOptionsFlow(config_entries.OptionsFlow):
             selector.NumberSelectorConfig(min=0, max=999, step=1, mode=selector.NumberSelectorMode.BOX)
         )
         schema.update(_max_power_field(values))
+        schema.update(_chargetronic_fields(values))
 
         return vol.Schema(schema)
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
+            user_input = _keep_chargetronic_secret(user_input, self._config_entry.options)
             merged = {**self._config_entry.data, **self._config_entry.options, **user_input}
             if merged.get(CONF_API_PROFILE) in V2_PROFILES:
                 if merged.get(CONF_API_PROFILE) == PROFILE_V2:

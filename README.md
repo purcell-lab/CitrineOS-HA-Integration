@@ -301,6 +301,33 @@ SetDefaultTariff together therefore sends all three in turn.
 
 ---
 
+## Chargetronic EV energy requests (0.9.0)
+
+Chargetronic devices read what an ISO 15118-2 or DIN 70121 car tells the charger over PLC and post it as signed webhooks. The integration receives them, so a charger that sends no NotifyEVChargingNeeds (OCPP 1.6, or 2.0.1 without ISO 15118) still has the car's needs and limits.
+
+**Set up** (Settings, Devices and services, CitrineOS, Configure):
+
+| Option | What to enter |
+|---|---|
+| Chargetronic webhook signing secret | The secret Chargetronic gives you (`whsec_...` or plain). Never shown back; leave blank to keep the saved one |
+| Chargetronic webhook ID | Pre-filled with a random ID. Give Chargetronic `https://<your HA external URL>/api/webhook/<ID>`. Blank switches the webhook off |
+| Chargetronic devices | `device_id=station_id` pairs, comma separated, e.g. `sp-dev-01=SIM-EV-EVEREST-V2G-03` |
+
+The endpoint must be publicly reachable over HTTPS (Nabu Casa, or a tunnel such as Cloudflare).
+
+**What it checks.** Every POST is verified as a [Standard Webhooks](https://www.standardwebhooks.com/) v1 HMAC-SHA256 signature over `{webhook-id}.{webhook-timestamp}.{body}`, and refused (401) when the signature is wrong or the timestamp is more than 5 minutes from now. Each event id is applied once, because delivery is at least once; a retry still gets 200. A malformed body gets 400.
+
+**What it provides**
+
+| Entity or event | Content |
+|---|---|
+| `sensor.chargetronic_events_received` (diagnostic) | Events applied; attributes: webhook path, device map, last event |
+| `sensor.chargetronic_<device>_energy_need` | Energy the plugged-in car still needs (Wh), unknown when unplugged. Attributes: protocol, `energy_need_source`, departure time (UTC), car max charge power, SoC (DIN only), final SoC, session energy and end reason |
+| Station max charge power | For a mapped station, the car's max charge power while plugged in, with source `chargetronic`, when CitrineOS has no ChargingNeeds charge limit. ChargingNeeds always wins. Chargetronic gives no discharge limit |
+| `citrine_ha_chargetronic` event | Each applied event's envelope plus the mapped `station_id`, for automations |
+
+ISO 15118-2 cars report no SoC; DIN 70121 cars do. For ISO 15118-2 the car's max charge power is the smaller of the on-board charger rating and phases x max current x 230 V (one phase when the count is missing). The departure time is the request time plus `departure_time_s`.
+
 ## Station power limits (0.6.2)
 
 Every discovered station gets two read-only sensors in W (device class power,
