@@ -206,3 +206,31 @@ def test_webhook_handler(monkeypatch):
     assert sent == [("citrine_ha_chargetronic_entry1", "sp-dev-01"), ("citrine_ha_chargetronic_entry1", None)]
     fired = hass.bus.async_fire.call_args.args
     assert fired[0] == "citrine_ha_chargetronic" and fired[1]["station_id"] == STATION
+
+
+# Live events from Chargetronic (18 November 2026): max_power_w and an absolute
+# departure_time, not the partner reference's field names.
+LIVE_ISO2 = {"phases": 3, "protocol": "iso15118-2", "e_amount_wh": 30000, "max_power_w": 22080,
+             "departure_time": "2026-11-19T04:59:59Z", "energy_need_wh": 30000, "ev_max_current_a": 32,
+             "ev_min_current_a": 6, "energy_need_source": "ev"}
+
+
+def test_live_iso2_event():
+    sessions = ChargetronicSessions({"sp-dev-01": STATION})
+    evt = {"id": "8929d788-0dfa-5d8e-b179-3131555d5c20", "type": "ev.energy_request",
+           "time": "2026-11-18T05:56:41.959Z", "device_id": "sp-dev-01",
+           "session_id": "01a1ed3a-87d4-7260-97f3-f70b6ac4f574", "data": LIVE_ISO2}
+    assert sessions.apply(evt) == APPLIED
+    s = sessions.active("sp-dev-01")
+    assert s["departure"] == "2026-11-19T04:59:59+00:00"
+    assert (s["energy_need_wh"], s["energy_need_source"], s["ev_max_power_w"]) == (30000, "ev", 22080)
+    assert sessions.charge_limits() == {STATION: 22080}
+
+
+def test_live_din_max_power_and_smallest_wins():
+    din = {"protocol": "din70121", "soc": 30, "capacity_wh": 60000, "max_power_w": 11000,
+           "energy_need_wh": 46666, "energy_need_source": "soc_capacity"}
+    assert ev_max_power_w(din) == 11000
+    assert ev_max_power_w({"protocol": "iso15118-2", "max_power_w": 22080, "ev_max_current_a": 16,
+                           "phases": 1}) == 3680
+    assert departure("2026-11-18T05:56:41Z", 3600, "not a time") == "2026-11-18T06:56:41+00:00"

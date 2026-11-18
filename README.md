@@ -301,7 +301,7 @@ SetDefaultTariff together therefore sends all three in turn.
 
 ---
 
-## Chargetronic EV energy requests (0.9.0)
+## Chargetronic EV energy requests (0.9.0, field names updated in 0.9.1)
 
 Chargetronic devices read what an ISO 15118-2 or DIN 70121 car tells the charger over PLC and post it as signed webhooks. The integration receives them, so a charger that sends no NotifyEVChargingNeeds (OCPP 1.6, or 2.0.1 without ISO 15118) still has the car's needs and limits.
 
@@ -326,7 +326,7 @@ The endpoint must be publicly reachable over HTTPS (Nabu Casa, or a tunnel such 
 | Station max charge power | For a mapped station, the car's max charge power while plugged in, with source `chargetronic`, when CitrineOS has no ChargingNeeds charge limit. ChargingNeeds always wins. Chargetronic gives no discharge limit |
 | `citrine_ha_chargetronic` event | Each applied event's envelope plus the mapped `station_id`, for automations |
 
-ISO 15118-2 cars report no SoC; DIN 70121 cars do. For ISO 15118-2 the car's max charge power is the smaller of the on-board charger rating and phases x max current x 230 V (one phase when the count is missing). The departure time is the request time plus `departure_time_s`.
+ISO 15118-2 cars report no SoC; DIN 70121 cars do. The car's max charge power is the smallest of `max_power_w` (Chargetronic's live events), `ev_max_power_w`, the on-board charger rating and, for AC, phases x max current x 230 V (one phase when the count is missing). The departure time is `departure_time` when sent (live events), else the request time plus `departure_time_s` (partner reference).
 
 ## Station power limits (0.6.2)
 

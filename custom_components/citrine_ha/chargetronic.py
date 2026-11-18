@@ -118,15 +118,15 @@ def _time(value: Any) -> datetime | None:
 def ev_max_power_w(data: dict[str, Any]) -> float | None:
     """The car's maximum charge power (W) from an ev.energy_request.
 
-    DIN 70121 reports power. ISO 15118-2 AC reports currents per phase and the
-    on-board charger rating: the smaller of the two, with one phase assumed
-    when the phase count is missing (the safer value).
+    Chargetronic's live events carry max_power_w for every protocol. The
+    partner reference names DIN 70121's ev_max_power_w and ISO 15118-2's
+    on-board charger rating and per-phase currents instead. The smallest
+    reported value wins, with one phase assumed when the phase count is
+    missing (the safer value).
     """
-    if data.get("protocol") == "din70121":
-        return number(data.get("ev_max_power_w"))
-    candidates = [number(data.get("onboard_charger_w"))]
+    candidates = [number(data.get(key)) for key in ("max_power_w", "ev_max_power_w", "onboard_charger_w")]
     current = number(data.get("ev_max_current_a"))
-    if current is not None:
+    if current is not None and data.get("protocol") != "din70121":
         phases = number(data.get("phases"))
         phases = phases if phases is not None and 1 <= phases <= 3 else 1
         candidates.append(current * phases * AC_PHASE_VOLTAGE_V)
@@ -134,8 +134,15 @@ def ev_max_power_w(data: dict[str, Any]) -> float | None:
     return min(values) if values else None
 
 
-def departure(event_time: Any, seconds: Any) -> str | None:
-    """ISO 15118-2 DepartureTime is seconds from the request: an absolute UTC time."""
+def departure(event_time: Any, seconds: Any, absolute: Any = None) -> str | None:
+    """The car's departure as an absolute UTC time.
+
+    Chargetronic's live events send departure_time as a time; the partner
+    reference sends departure_time_s, seconds from the request.
+    """
+    when = _time(absolute) if absolute else None
+    if when is not None:
+        return when.isoformat()
     start, offset = _time(event_time), number(seconds)
     if start is None or offset is None or offset < 0:
         return None
@@ -214,7 +221,8 @@ class ChargetronicSessions:
             current["energy_need_wh"] = number(data.get("e_amount_wh", data.get("energy_request_wh")))
         current["energy_need_source"] = data.get("energy_need_source")
         current["ev_max_power_w"] = ev_max_power_w(data)
-        current["departure"] = departure(event.get("time"), data.get("departure_time_s"))
+        current["departure"] = departure(event.get("time"), data.get("departure_time_s"),
+                                         data.get("departure_time"))
         current["soc"] = number(data.get("soc"))  # DIN only: ISO 15118-2 reports no SoC
         current["capacity_wh"] = number(data.get("capacity_wh"))
 
