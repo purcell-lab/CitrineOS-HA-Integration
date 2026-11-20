@@ -358,10 +358,17 @@ def test_lab_entity_ids_for_every_discovered_station():
     assert ids == [
         "sensor.citrineos_everest_v2g_lab_sim_ev_everest_v2g_03_max_discharge_power",
         "sensor.citrineos_everest_v2g_lab_sim_ev_everest_v2g_03_max_charge_power",
+        "sensor.citrineos_everest_v2g_lab_sim_ev_everest_v2g_03_ev_state_of_charge",
         "sensor.citrineos_lab_real_01_max_discharge_power",
         "sensor.citrineos_lab_real_01_max_charge_power",
+        "sensor.citrineos_lab_real_01_ev_state_of_charge",
     ]
-    assert sensors[2].device_info["model"] == "Physical charger (read only)"
+    assert sensors[3].device_info["model"] == "Physical charger (read only)"
+    soc = sensors[2]
+    assert (soc.device_class, soc.state_class, soc.native_unit_of_measurement) == ("battery", "measurement", "%")
+    assert soc.native_value is None
+    data["stations"][0]["ev_soc"] = {"value": 47.0, "timestamp": "t", "transaction_id": "uuid-1"}
+    assert soc.native_value == 47.0 and soc.extra_state_attributes["transaction_id"] == "uuid-1"
     sensor = sensors[0]
     assert isinstance(sensor, LabMaxPowerSensor)
     assert sensor.unique_id == f"entry_{LAB}_lab_max_discharge_power"

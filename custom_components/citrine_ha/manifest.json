@@ -16,5 +16,5 @@
     "custom_components.citrine_ha"
   ],
   "requirements": [],
-  "version": "0.9.1"
+  "version": "0.10.0"
 }

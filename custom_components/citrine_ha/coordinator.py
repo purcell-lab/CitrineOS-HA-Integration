@@ -42,6 +42,7 @@ from .const import (
     MIN_MAX_POWER_W,
 )
 from .hasura_client import HasuraAuthError, HasuraClient, HasuraError
+from .ev_soc import EvSocReader
 from .power_limits import PowerLimitReader
 from .compatibility import (
     CONF_API_PROFILE, PROFILE_V2, PROFILE_LAB, V2_PROFILES, V2_DISCOVERY_QUERY, normalize_v2_discovery,
@@ -102,6 +103,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._capability_cache: dict[str, dict[str, Any]] = {}
         self._profile_prefs: dict[str, dict[str, Any]] = {}
         self._power_limits = PowerLimitReader(hasura_client)
+        self._ev_soc = EvSocReader(hasura_client)
         # Chargetronic sessions, set by the integration when its webhook is configured.
         self.chargetronic: Any | None = None
 
@@ -112,6 +114,7 @@ class CitrineCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Never fails discovery: a refused or missing table only drops a source.
             overrides = self.chargetronic.charge_limits() if self.chargetronic is not None else None
             await self._power_limits.async_attach(data, self.default_max_power_w, overrides)
+            await self._ev_soc.async_attach(data, tenant_id)
             return data
         except (CitrineApiError, HasuraError, ValueError) as err:
             # A lab dispatch still ends after its evidence window while polls fail.

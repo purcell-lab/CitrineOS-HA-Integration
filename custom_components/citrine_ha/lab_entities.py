@@ -8,7 +8,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.core import SupportsResponse
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
-from homeassistant.const import UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfPower
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -658,6 +658,35 @@ class LabMaxPowerSensor(LabEntity, SensorEntity):
                             self.coordinator.default_max_power_w)[1]
 
 
+class LabEvSocSensor(LabEntity, SensorEntity):
+    """The plugged-in EV's state of charge, as the station reports it over OCPP (read only)."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_translation_key = "ev_soc"
+
+    def __init__(self, ctx, entry, sid):
+        super().__init__(ctx, entry, "ev_soc", "EV state of charge", sid)
+
+    @property
+    def available(self):
+        # Unknown, not unavailable, while no EV with a SoC reading is plugged in.
+        return CoordinatorEntity.available.fget(self)
+
+    def _soc(self):
+        return station(self.coordinator.data, self._station_id).get("ev_soc") or {}
+
+    @property
+    def native_value(self):
+        return self._soc().get("value")
+
+    @property
+    def extra_state_attributes(self):
+        soc = self._soc()
+        return {"timestamp": soc.get("timestamp"), "transaction_id": soc.get("transaction_id")}
+
+
 class LabChargingLimitSensor(LabEntity, SensorEntity):
     """The EMS or other external charging limit in effect now on the command station."""
 
@@ -692,7 +721,8 @@ def max_power_sensors(ctx, entry, known):
         if not isinstance(sid, str) or not sid or sid in known:
             continue
         known.add(sid)
-        entities += [LabMaxPowerSensor(ctx, entry, sid, DISCHARGE), LabMaxPowerSensor(ctx, entry, sid, CHARGE)]
+        entities += [LabMaxPowerSensor(ctx, entry, sid, DISCHARGE), LabMaxPowerSensor(ctx, entry, sid, CHARGE),
+                     LabEvSocSensor(ctx, entry, sid)]
     return entities
 
 
