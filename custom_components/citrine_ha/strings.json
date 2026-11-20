@@ -92,6 +92,17 @@
   },
   "entity": {
     "sensor": {
+      "ev_soc": {
+        "name": "EV state of charge",
+        "state_attributes": {
+          "timestamp": {
+            "name": "Reading time"
+          },
+          "transaction_id": {
+            "name": "Transaction ID"
+          }
+        }
+      },
       "max_discharge_power": {
         "name": "Max discharge power",
         "state_attributes": {
